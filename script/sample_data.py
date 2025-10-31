@@ -11,7 +11,6 @@ import open3d as o3d
 # ---- Recommended environment variables (to mitigate contention for render/replicator/unload) ----
 os.environ.setdefault("OMNI_KIT_HEADLESS", "1")          # headless
 os.environ.setdefault("CARB_LOG", "warn")                # Suppress logs
-# Optionally, disable replicator-related plugins (works without them)
 os.environ.setdefault("OMNI_KIT_DISABLE_PLUGINS", "omni.syntheticdata.plugin,omni.replicator.core,omni.replicator.isaac")
 
 import omnigibson as og
@@ -37,14 +36,48 @@ def get_random_xy_batch(env, n: int):
     """
     Samples n (x,y) coordinates from the scene's AABB.
     """
-    low, high = lazy.omni.usd.get_context().compute_path_world_bounding_box(env.scene.prim_path)
-    x_min, y_min = float(low[0]), float(low[1])
-    x_max, y_max = float(high[0]), float(high[1])
+    x_min, x_max = -25.0, 28.0
+    y_min, y_max = -3.0, 43.0
 
     x_coords = np.random.uniform(x_min, x_max, size=(n,))
     y_coords = np.random.uniform(y_min, y_max, size=(n,))
     
     return np.stack([x_coords, y_coords], axis=1).astype(np.float32)
+
+
+def sample_z_mixed(n, beta_upper=0.5):
+    """
+    Samples z coordinates from a mixed distribution.
+    - 80% uniform from [0m, 2.8m]
+    - 20% exponential from [2.8m, 20m] peaked at 2.8m
+    """
+    n_lower = int(n * 0.8)
+    n_upper = n - n_lower
+
+    # 1. Lower uniform part
+    z_lower = np.random.uniform(0.0, 2.8, size=n_lower)
+
+    # 2. Upper exponential part
+    z_upper = []
+    while len(z_upper) < n_upper:
+        # Oversample to reduce the number of loops
+        oversample_factor = 1.5
+        num_to_sample = int((n_upper - len(z_upper)) * oversample_factor)
+        if num_to_sample == 0:
+            num_to_sample = 1
+        
+        x = np.random.exponential(scale=beta_upper, size=num_to_sample)
+        z = 2.8 + x
+        valid_z = z[(z >= 2.8) & (z <= 20.0)]
+        z_upper.extend(valid_z.tolist())
+    if z_upper and len(z_upper) > n_upper:
+        z_upper = z_upper[:n_upper]
+
+    # Combine and shuffle
+    z_samples = np.concatenate([z_lower, np.array(z_upper)])
+    np.random.shuffle(z_samples)
+    
+    return z_samples.astype(np.float32)
 
 
 def sample_free_space_points_batch(env,
@@ -60,9 +93,6 @@ def sample_free_space_points_batch(env,
     - radius: Radius of the sphere for collision checking
     - xy_mode: "traversable" (from traversable map) or "aabb" (from scene AABB)
     """
-    low, high = lazy.omni.usd.get_context().compute_path_world_bounding_box(env.scene.prim_path)
-    z_min, z_max = float(low[2]), float(high[2])
-
     results = []
     # Warm-up
     for _ in range(3):
@@ -78,7 +108,7 @@ def sample_free_space_points_batch(env,
             raise ValueError(f"Unknown xy_mode: {xy_mode}")
 
         # 2) z batch
-        z = np.random.uniform(z_min, z_max, size=(xy.shape[0],)).astype(np.float32)
+        z = sample_z_mixed(n=xy.shape[0])
 
         pts = np.concatenate([xy, z[:, None]], axis=1)  # [B,3]
 
@@ -98,12 +128,16 @@ def sample_free_space_points_batch(env,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--num", type=int, default=100000, help="Number of free-space points to sample")
-    parser.add_argument("--scene", type=str, help="Scene model name (e.g., Rs_int). If not specified, it will be selected interactively.")
+    parser.add_argument("--scene", type=str, default="house_single_floor", help="Scene model name (e.g., Rs_int). If not specified, it will be selected interactively.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed (if reproducibility is needed)")
     parser.add_argument("--output", type=str, default=None, help="Output .ply file path. If not specified, it is automatically generated based on the scene name.")
     parser.add_argument("--batch-xy", type=int, default=2000, help="Number of (x,y) candidates to generate at once")
-    parser.add_argument("--radius", type=float, default=0.01, help="Collision check sphere radius")
+    parser.add_argument("--radius", type=float, default=0.1, help="Collision check sphere radius")
     parser.add_argument("--xy-mode", type=str, default="aabb", choices=["traversable", "aabb"], help="xy sampling method")
+    
+    parser.add_argument("--activity_name", type=str, default="sorting_household_items", help="BEHAVIOR activity to load. If specified, objects for the task will be loaded.")
+    parser.add_argument("--activity_definition_id", type=int, default=0, help="Definition ID for the activity.")
+    parser.add_argument("--activity_instance_id", type=int, default=0, help="Instance ID for the activity.")
     args = parser.parse_args()
 
     # RNG
@@ -123,12 +157,27 @@ def main():
 
     config = {
         "scene": {"type": "InteractiveTraversableScene", "scene_model": scene_model},
-        "robots": [],
+        "robots": [{
+            "type": "Fetch",
+        }],
         "headless": True,
     }
+    
+    # If an activity is specified, load task-relevant objects
+    if args.activity_name:
+        config["scene"]["load_task_relevant_only"] = False
+        # config["scene"]["not_load_object_categories"] = ["ceilings"]
+        config["task"] = {
+            "type": "BehaviorTask",
+            "activity_name": args.activity_name,
+            "activity_definition_id": args.activity_definition_id,
+            "activity_instance_id": args.activity_instance_id,
+            "online_object_sampling": False,
+        }
 
-    env = None
     env = og.Environment(configs=config)
+    robot = env.robots[0]
+    robot.set_position_orientation(position=np.array([-1.0, -10.0, 2.0]))
     env.reset()
     for _ in range(5):
         og.sim.step()

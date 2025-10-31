@@ -3,8 +3,7 @@ import numpy as np
 import os
 import imageio.v2 as imageio
 import argparse
-import viser
-import time
+import plotly.graph_objects as go
 
 def main():
     """
@@ -47,9 +46,9 @@ def main():
         print(f"Error: Data directory not found or incomplete. {e}")
         return
 
-    if not (len(rgb_files) == len(depth_files) == len(pose_files)):
-        print("Error: The number of rgb, depth, and pose files must be the same.")
-        return
+    # if not (len(rgb_files) == len(depth_files) == len(pose_files)):
+    #     print("Error: The number of rgb, depth, and pose files must be the same.")
+    #     return
     
     if not rgb_files:
         print("Error: No data found in the specified directory.")
@@ -57,7 +56,7 @@ def main():
 
     all_pcds = []
     
-    for i in range(0, len(rgb_files), 100):
+    for i in range(0, len(rgb_files), 20):
         print(f"Processing frame {i+1}/{len(rgb_files)}: {os.path.basename(rgb_files[i])}")
         
         # Load data for the current frame
@@ -98,20 +97,43 @@ def main():
     print("Downsampling the combined point cloud with a voxel size of 0.1...")
     downsampled_pcd = combined_pcd.voxel_down_sample(voxel_size=0.1)
 
-    print("Visualizing the final point cloud with Viser...")
-    server = viser.ViserServer()
+    # Calculate and print the bounding box
+    bbox = downsampled_pcd.get_axis_aligned_bounding_box()
+    min_bound = bbox.min_bound
+    max_bound = bbox.max_bound
+    print(f"Point cloud bounding box:\n  Min bound: {min_bound}\n  Max bound: {max_bound}")
+
+    print("Generating Plotly 3D visualization and saving to HTML...")
     points = np.asarray(downsampled_pcd.points)
-    colors = (np.asarray(downsampled_pcd.colors) * 255).astype(np.uint8)
+    colors = np.asarray(downsampled_pcd.colors)
     
-    server.add_point_cloud(
-        name="/point_cloud",
-        points=points,
-        colors=colors,
+    fig = go.Figure(data=[go.Scatter3d(
+        x=points[:, 0],
+        y=points[:, 1],
+        z=points[:, 2],
+        mode='markers',
+        marker=dict(
+            size=1,
+            color=colors,
+            opacity=0.8
+        )
+    )])
+
+    fig.update_layout(
+        title='Point Cloud',
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y',
+            zaxis_title='Z',
+            aspectratio=dict(x=1, y=1, z=1),
+            aspectmode='data'
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
     )
-    
-    print("Viewer running. Open http://localhost:8080 in your browser.")
-    while True:
-        time.sleep(1.0)
+
+    output_filename = "point_cloud.html"
+    fig.write_html(output_filename)
+    print(f"Point cloud visualization saved to {os.path.abspath(output_filename)}")
 
 
 if __name__ == "__main__":

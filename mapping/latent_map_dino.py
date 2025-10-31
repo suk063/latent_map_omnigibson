@@ -11,8 +11,8 @@ from collections import defaultdict
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset
-from tqdm import tqdm
-
+from tqdm import tqdm   
+from torch.utils.tensorboard import SummaryWriter
 # local modules
 from mapping_lib.utils import get_3d_coordinates
 from mapping_lib.voxel_hash_table import VoxelHashTable
@@ -77,14 +77,56 @@ class DINOv3Wrapper(torch.nn.Module):
 
         return fmap
 
-transform = transforms.Compose(
-    [
-        transforms.Normalize(
-            mean=(0.485, 0.456, 0.406),  # DINOv3 normalization
-            std=(0.229, 0.224, 0.225),
-        ),
-    ]
-) 
+transform = transforms.Compose([
+    transforms.Resize((256, 256), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+])
+
+# ==============================================================================================
+# PCA Visualization Function
+# ==============================================================================================
+def run_pca_visualization(server, grid, decoder, coords_list, env_name, epoch_label, device):
+    """Runs PCA on voxel features and sends them to the Viser server."""
+    if not coords_list:
+        print(f"[VIS] No coordinates to visualize for epoch {epoch_label}.")
+        return
+
+    print(f"\n[VIS] Running PCA on voxel features for {env_name} (epoch: {epoch_label})...")
+
+    vertices_vis = torch.cat(coords_list, dim=0).numpy()
+
+    max_points_for_vis = 2000000
+    if vertices_vis.shape[0] > max_points_for_vis:
+        print(f"[VIS] Downsampling from {vertices_vis.shape[0]} to {max_points_for_vis} points for PCA visualization.")
+        indices = np.random.choice(vertices_vis.shape[0], max_points_for_vis, replace=False)
+        vertices_vis = vertices_vis[indices]
+
+    if vertices_vis.shape[0] == 0:
+        print("[VIS] No vertices to visualize; skipping PCA visualization.")
+        return
+
+    coords_t = torch.from_numpy(vertices_vis).to(device)
+    with torch.no_grad():
+        voxel_feat = grid.query_voxel_feature(coords_t)
+        feats_t = decoder(voxel_feat)
+
+    feats_np = feats_t.cpu().numpy()
+    pca = PCA(n_components=3)
+    feats_pca = pca.fit_transform(feats_np)
+    scaler = MinMaxScaler()
+    feats_pca_norm = scaler.fit_transform(feats_pca)
+
+    z_threshold = 2.0
+    vis_mask = vertices_vis[:, 2] <= z_threshold
+    filtered_vertices = vertices_vis[vis_mask]
+    filtered_colors = feats_pca_norm[vis_mask]
+
+    print(f"[VIS] Updating PCA visualization for {env_name} (epoch: {epoch_label}) to Viser.")
+    server.add_point_cloud(
+        name=f"/pca/{env_name}",
+        points=filtered_vertices,
+        colors=(filtered_colors * 255).astype(np.uint8),
+        point_size=0.01
+    )
 
 # --------------------------------------------------------------------------- #
 #  Dataset Class                                                              #
@@ -107,7 +149,7 @@ class SingleEnvDataset(Dataset):
             cam_to_world_poses_list.append(c2w)
         self.cam_to_world_poses = np.array(cam_to_world_poses_list)
 
-        img_h = 720  # Image height from render_data.py
+        img_h = 256  # New image height
         patch_size = 16  # DINOv3 patch size
         self.feat_h = img_h // patch_size
 
@@ -146,7 +188,8 @@ class SingleEnvDataset(Dataset):
         img_tensor = self.transform_func(img_tensor)
 
         depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0).float() # Depth is in meters
-        depth_t = F.interpolate(depth_t, (self.feat_h, self.feat_h), mode="nearest-exact").squeeze()
+        depth_t_resized = F.interpolate(depth_t, (256, 256), mode="nearest-exact")
+        depth_t = F.interpolate(depth_t_resized, (self.feat_h, self.feat_h), mode="nearest-exact").squeeze()
 
         E_cv = self.cam_to_world_poses[pose_idx][:3, :]
         extrinsic_t = torch.from_numpy(E_cv).float()
@@ -183,7 +226,7 @@ parser.add_argument(
 parser.add_argument(
     "--epochs",
     type=int,
-    default=20,
+    default=30,
     help="Number of training epochs per environment."
 )
 parser.add_argument(
@@ -191,6 +234,13 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Train the model. If False, load pre-trained model for visualization only."
+)
+parser.add_argument(
+    "--continue",
+    dest="continue_training",
+    action="store_true",
+    default=False,
+    help="Continue training from a saved grid and decoder."
 )
 parser.add_argument(
     "--save",
@@ -205,16 +255,10 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "--viser-host",
-    type=str,
-    default="0.0.0.0",
-    help="Host for the Viser server."
-)
-parser.add_argument(
-    "--viser-port",
+    "--vis-interval",
     type=int,
-    default=8080,
-    help="Port for the Viser server."
+    default=1,
+    help="Epoch interval for PCA visualization during training. Set to 0 to disable."
 )
 parser.add_argument(
     "--decoder-path",
@@ -227,6 +271,12 @@ parser.add_argument(
     type=int,
     default=-1,
     help="Number of images to use from the dataset. -1 to use all."
+)
+parser.add_argument(
+    "--load-run-dir",
+    type=str,
+    default=None,
+    help="Path to a run directory to load model from for continuation or inference."
 )
 args = parser.parse_args()
 
@@ -272,8 +322,13 @@ OPT_LR = 1e-3
 # --------------------------------------------------------------------------- #
 #  Scene bounds (should match map_table.py)                                   #
 # --------------------------------------------------------------------------- #
-SCENE_MIN = (-6.5, -11.0, -0.5)
-SCENE_MAX = (7.0,  3.0,  3.0)
+# SCENE_MIN = (-6.5, -11.0, -0.5)
+# SCENE_MAX = (7.0,  3.0,  3.0)
+
+
+SCENE_MIN = (-7.0, -5.5, -1.0)
+SCENE_MAX = (7.0,  9.5,  3.0)
+
 
 # --------------------------------------------------------------------------- #
 #  Helper functions                                                           #
@@ -291,11 +346,18 @@ def load_w2c_poses_from_dir(dir_path: str) -> np.ndarray:
 #  Main processing loop                                                       #
 # --------------------------------------------------------------------------- #
 def main():
-    server = viser.ViserServer(host=args.viser_host, port=args.viser_port)
+    server = viser.ViserServer(host="0.0.0.0", port=8080)
     dataset_path = Path(args.dataset_dir)
     output_path = Path(args.output_dir)
     if args.save or args.pca:
         output_path.mkdir(parents=True, exist_ok=True)
+
+    if args.load_run_dir:
+        load_path = Path(args.load_run_dir)
+        print(f"[LOAD] Attempting to load model from specified run directory: {load_path}")
+        assert load_path.is_dir(), f"Specified load directory does not exist: {load_path}"
+    else:
+        load_path = output_path
 
     intrinsic_path = dataset_path / "intrinsics.txt"
     if not intrinsic_path.exists():
@@ -303,6 +365,12 @@ def main():
         return
     K = np.loadtxt(intrinsic_path)
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+
+    # Adjust intrinsics for the new image size (256x256) from original (512x512)
+    fx = fx * (256 / 512)
+    fy = fy * (256 / 512)
+    cx = cx * (256 / 512)
+    cy = cy * (256 / 512)
 
     try:
         world_to_cam_poses = load_w2c_poses_from_dir(args.poses_dir)
@@ -324,15 +392,19 @@ def main():
 
     env_name = dataset_path.name
 
+    log_dir = output_path / f"runs/{env_name}_{time.strftime('%Y%m%d-%H%M%S')}"
+    tb_writer = SummaryWriter(log_dir=log_dir)
+    print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
+
     # 1. Create or load VoxelHashTable
     grid = None
     agg_coords = []
     
     if args.train:
-        grid_path = output_path / "grid.pt"
-        decoder_path = output_path / "decoder.pt"
+        grid_path = load_path / "grid.pt"
+        decoder_path = load_path / "decoder.pt"
 
-        if grid_path.exists() and decoder_path.exists():
+        if args.continue_training and grid_path.exists() and decoder_path.exists():
             print(f"\n[LOAD] Found existing grid and decoder. Loading for continued training...")
             
             # Load decoder
@@ -387,7 +459,7 @@ def main():
     else:
         # Inference mode: Load pre-trained grid
         print("\n[LOAD] Loading pre-trained grid for visualization...")
-        sparse_grid_path = output_path / "grid.sparse.pt"
+        sparse_grid_path = load_path / "grid.sparse.pt"
         if not sparse_grid_path.exists():
             print(f"[LOAD] [ERROR] Pre-trained grid not found at {sparse_grid_path}. Please train first.")
             return
@@ -403,7 +475,7 @@ def main():
         print(f"[LOAD] Loaded grid from {sparse_grid_path}")
         
         # Load decoder weights
-        decoder_path = output_path / "decoder.pt"
+        decoder_path = load_path / "decoder.pt"
         if not decoder_path.exists():
             print(f"[ERROR] Pre-trained decoder not found at {decoder_path}. Cannot proceed with visualization.")
             return
@@ -462,6 +534,7 @@ def main():
         LOG_INTERVAL = 100
         for epoch in range(args.epochs):
             loss_history = []
+            epoch_coords = []
             
             for i, data in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}")):
                 # --- Get preprocessed data from dataset ---
@@ -476,7 +549,7 @@ def main():
                 coords_world, _ = get_3d_coordinates(
                     depth_t, extrinsic_t,
                     fx=fx, fy=fy, cx=cx, cy=cy,
-                    original_size=720,
+                    original_size=256,
                 )
 
                 B, C_, Hf, Wf = vis_feat.shape
@@ -500,7 +573,8 @@ def main():
                 coords_valid = coords_valid[in_bounds].to(DEVICE)
 
                 # accumulate for visualization (store on CPU to save GPU mem)
-                agg_coords.append(coords_valid.cpu())
+                if args.pca:
+                    epoch_coords.append(coords_valid.cpu())
                 feats_valid = feats_valid[in_bounds].to(DEVICE)
             
                 
@@ -516,6 +590,10 @@ def main():
 
                 loss_history.append(loss.item())
 
+
+                global_step = epoch * len(dataloader) + i
+                tb_writer.add_scalar("Loss/step", loss.item(), global_step)
+
                 if (i + 1) % LOG_INTERVAL == 0:
                     total_steps = len(dataloader)
                     print(f"[Epoch {epoch+1}/{args.epochs}] [{i+1}/{total_steps}] Loss: {loss.item():.4f}")
@@ -523,6 +601,26 @@ def main():
             avg_loss = sum(loss_history) / len(loss_history) if loss_history else 0
             print(f"[Epoch {epoch+1}/{args.epochs}] Avg. Loss: {avg_loss:.4f}")
 
+
+            tb_writer.add_scalar("Loss/epoch", avg_loss, epoch + 1)
+
+            # --- Periodic PCA Visualization ---
+            if args.pca and args.vis_interval > 0 and (epoch + 1) % args.vis_interval == 0:
+                run_pca_visualization(server, grid, decoder, epoch_coords, env_name, epoch + 1, DEVICE)
+
+            # --- Save checkpoint after each epoch ---
+            if args.save:
+                dense_grid_path = log_dir / f"grid_epoch_{epoch+1}.pt"
+                sparse_grid_path = log_dir / f"grid.sparse_epoch_{epoch+1}.pt"
+                grid.save_dense(dense_grid_path)
+                grid.save_sparse(sparse_grid_path)
+                print(f"[SAVE] Saved grid for epoch {epoch+1} to {dense_grid_path} and {sparse_grid_path}")
+                
+                decoder_path = log_dir / f"decoder_epoch_{epoch+1}.pt"
+                torch.save(decoder.state_dict(), decoder_path)
+                print(f"[SAVE] Saved decoder for epoch {epoch+1} to {decoder_path}")
+
+ 
         # ----------------------------------------------------------------------- #
         #  Check hash collisions in infer mode                                     #
         # ----------------------------------------------------------------------- #
@@ -547,13 +645,13 @@ def main():
                 print(f"    {level_name}: 0 voxels")
 
         if args.save:
-            dense_grid_path = output_path / "grid.pt"
-            sparse_grid_path = output_path / "grid.sparse.pt"
+            dense_grid_path = log_dir / "grid.pt"
+            sparse_grid_path = log_dir / "grid.sparse.pt"
             grid.save_dense(dense_grid_path)
             grid.save_sparse(sparse_grid_path)
             print(f"[SAVE] Saved grid to {dense_grid_path} and {sparse_grid_path}")
 
-            decoder_path = output_path / "decoder.pt"
+            decoder_path = log_dir / "decoder.pt"
             torch.save(decoder.state_dict(), decoder_path)
             print(f"[SAVE] Saved decoder to {decoder_path}")
     else:
@@ -570,7 +668,7 @@ def main():
         if not rgb_files or not depth_files:
             print(f"[VIS] [WARN] No data found in {env_name}, skipping.")
         else:
-            img_h = 720  # Image height from render_data.py
+            img_h = 256  # New image height
             patch_size = 16  # DINOv3 patch size
             feat_h = img_h // patch_size
             for i, (rgb_path, depth_path) in enumerate(tqdm(zip(rgb_files, depth_files), desc=f"Loading {env_name}", total=len(rgb_files))):
@@ -588,7 +686,7 @@ def main():
                 coords_world, _ = get_3d_coordinates(
                     depth_t, extrinsic_t,
                     fx=fx, fy=fy, cx=cx, cy=cy,
-                    original_size=720,
+                    original_size=256,
                 )
                 
                 coords_valid = coords_world.permute(0, 2, 3, 1).reshape(-1, 3)
@@ -617,49 +715,15 @@ def main():
         if not intrinsic_path.exists():
             print(f"[VIS] [ERROR] Intrinsic file not found at {intrinsic_path}. Skipping PCA.")
         else:
-            print(f"\n[VIS] Running PCA on voxel features for {env_name} ...")
-
-            if not agg_coords:
-                print(f"[VIS] No aggregated coordinates found for {env_name}, skipping PCA.")
+            if args.train:
+                # In training mode, periodic visualization is used. A final visualization can be triggered if needed.
+                if args.vis_interval == 0:
+                     print("\n[VIS] To see PCA visualization during training, set a value for --vis-interval (e.g., --vis-interval 5).")
             else:
-                # Concatenate all coordinate tensors for the environment and convert to numpy
-                vertices_vis = torch.cat(agg_coords, dim=0).numpy()
-                
-                # Optional: Downsample if there are too many points to avoid slow visualization
-                max_points_for_vis = 2000000
-                if vertices_vis.shape[0] > max_points_for_vis:
-                    print(f"[VIS] Downsampling from {vertices_vis.shape[0]} to {max_points_for_vis} points for PCA visualization.")
-                    indices = np.random.choice(vertices_vis.shape[0], max_points_for_vis, replace=False)
-                    vertices_vis = vertices_vis[indices]
+                # In inference mode, run PCA on all aggregated coordinates.
+                run_pca_visualization(server, grid, decoder, agg_coords, env_name, "final", DEVICE)
 
-                if vertices_vis.shape[0] == 0:
-                    print("[VIS] No vertices to visualize; skipping PCA visualization.")
-                else:
-                    coords_t = torch.from_numpy(vertices_vis).to(DEVICE)
-                    with torch.no_grad():
-                        voxel_feat = grid.query_voxel_feature(coords_t)
-                        feats_t    = decoder(voxel_feat)
-                    
-                    feats_np = feats_t.cpu().numpy()
-                    pca = PCA(n_components=3)
-                    feats_pca = pca.fit_transform(feats_np)
-                    scaler = MinMaxScaler()
-                    feats_pca_norm = scaler.fit_transform(feats_pca)
-                    
-                    # Filter points with z > 2.5 for visualization
-                    z_threshold = 2.2
-                    vis_mask = vertices_vis[:, 2] <= z_threshold
-                    filtered_vertices = vertices_vis[vis_mask]
-                    filtered_colors = feats_pca_norm[vis_mask]
-
-                    # Create Viser point cloud
-                    print(f"[VIS] Sending PCA visualization for {env_name} to Viser.")
-                    server.add_point_cloud(
-                        name=f"/pca/{env_name}",
-                        points=filtered_vertices,
-                        colors=(filtered_colors * 255).astype(np.uint8),
-                        point_size=0.01
-                    )
+    tb_writer.close()
 
     if args.pca:
         print("\n[VIS] Viser server is running. Open the link in your browser.")
