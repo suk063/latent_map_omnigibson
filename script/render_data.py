@@ -15,16 +15,18 @@ import copy
 import viser
 from scipy.spatial.transform import Rotation
 import yaml
+from tqdm import tqdm
 
 # Make sure object states are enabled
 gm.ENABLE_OBJECT_STATES = True
 gm.USE_GPU_DYNAMICS = False
 
 
-def save_data(frame_idx, rgb_image, depth_image, pos, orn, rgb_dir, depth_dir, poses_dir):
+def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, pos, orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir):
     frame_filename_base = f"{frame_idx:05d}"
     imageio.imwrite(os.path.join(rgb_dir, f"{frame_filename_base}.png"), rgb_image)
     np.save(os.path.join(depth_dir, f"{frame_filename_base}.npy"), depth_image)
+    np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image)
     
     # Construct and save the extrinsic matrix in OpenCV format (world-to-camera)
     R_world_og = Rotation.from_quat(orn.cpu().numpy()).as_matrix()
@@ -54,7 +56,7 @@ def main():
     parser = argparse.ArgumentParser(description="Render images from sampled poses.")
     parser.add_argument("--points_file", type=str, default="house_single_floor_points.ply",
                         help="Path to the .ply file containing points.")
-    parser.add_argument("--num_samples", type=int, default=10000,
+    parser.add_argument("--num_samples", type=int, default=30000,
                         help="Number of points to sample and render.")
     parser.add_argument("--scene", type=str, default="house_single_floor", help="Scene model to load. If not specified, will prompt for selection.")
     parser.add_argument("--activity_name", type=str, default="sorting_household_items", help="BEHAVIOR activity to load. If specified, objects for the task will be loaded.")
@@ -78,11 +80,11 @@ def main():
     data_dir = os.path.join("mapping/dataset", args.activity_name)
     rgb_dir = os.path.join(data_dir, "rgb")
     depth_dir = os.path.join(data_dir, "depth")
-    # seg_instance_dir = os.path.join(data_dir, "seg_instance")
+    seg_instance_id_dir = os.path.join(data_dir, "seg_instance_id")
     poses_dir = os.path.join(data_dir, "poses")
     os.makedirs(rgb_dir, exist_ok=True)
     os.makedirs(depth_dir, exist_ok=True)
-    # os.makedirs(seg_instance_dir, exist_ok=True)
+    os.makedirs(seg_instance_id_dir, exist_ok=True)
     os.makedirs(poses_dir, exist_ok=True)
     
     # Configuration for the environment
@@ -95,7 +97,7 @@ def main():
             "external_sensors": [{
                 "sensor_type": "VisionSensor",
                 "name": "my_sensor",
-                "modalities": ["rgb", "depth_linear", "seg_instance"],
+                "modalities": ["rgb", "depth_linear", "seg_instance_id"],
                 # "modalities": ["rgb","depth_linear"],
                 "sensor_kwargs": {
                     "image_height": 512,
@@ -146,7 +148,7 @@ def main():
     image_width = config["env"]["external_sensors"][0]["sensor_kwargs"]["image_width"]
     image_height = config["env"]["external_sensors"][0]["sensor_kwargs"]["image_height"]
     focal_length = 17.0  # Default value from VisionSensor
-    horizontal_aperture = 20.995  # Default value from VisionSensor
+    horizontal_aperture = 40.0  # Default value from VisionSensor
 
     # Calculate visualization parameters
     aspect_ratio = image_width / image_height
@@ -166,7 +168,7 @@ def main():
     all_world_points = []
     all_colors = []
     valid_sample_count = 0
-    for i, point in enumerate(points):
+    for i, point in enumerate(tqdm(points, desc="Processing points")):
         # 1. Get first sample for evaluation
         orientation = sample_random_orientation()
         
@@ -179,14 +181,20 @@ def main():
         obs, _ = sensor.get_obs()
         rgb_image = copy.deepcopy(obs["rgb"][..., :3].cpu().numpy())
         depth_image = copy.deepcopy(obs["depth_linear"].cpu().numpy().squeeze())
+        seg_instance_id_image = copy.deepcopy(obs["seg_instance_id"].cpu().numpy().squeeze())
 
         # Filter based on depth image - if view is mostly bad, skip
         total_pixels = depth_image.size
-        too_close_pixels = np.sum(depth_image <= 0.1)
+        too_close_pixels = np.sum(depth_image <= 0.15)
         too_far_pixels = np.sum(depth_image >= 10)
         if (too_far_pixels / total_pixels) > 0.5 or (too_close_pixels / total_pixels) > 0.5:
             print(f"  -> Skipping point {i} due to invalid depth values in initial sample.")
             continue
+        
+        # Save the initial sample if it passes the depth filter
+        save_data(valid_sample_count, rgb_image, depth_image, seg_instance_id_image, cur_pos, cur_orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir)
+        valid_sample_count += 1
+        time.sleep(0.01)
             
         # 2. Generate world point cloud to check condition
         points_camera, _ = helper.depth_to_point_cloud(depth_image, rgb_image, intrinsic_matrix)
@@ -195,45 +203,46 @@ def main():
         points_camera[:, 1] *= -1.0
         points_camera[:, 2] *= -1.0
         
-        world_points = helper.transform_point_cloud(points_camera, cur_pos, cur_orn).cpu().numpy()
+        # world_points = helper.transform_point_cloud(points_camera, cur_pos, cur_orn).cpu().numpy()
 
         # 3. Check z-value condition
-        z_values = world_points[:, 2]
-        if len(z_values) == 0:
-            print(f"  -> No valid points in point cloud for sample {i}. Skipping.")
-            continue
+        # z_values = world_points[:, 2]
+        # if len(z_values) == 0:
+        #     print(f"  -> No valid points in point cloud for sample {i}. Skipping.")
+        #     continue
             
-        valid_z_mask = (z_values >= 0.1) & (z_values <= 5.0)
-        valid_z_ratio = np.sum(valid_z_mask) / len(z_values)
+        # valid_z_mask = (z_values >= 0.1) & (z_values <= 5.0)
+        # valid_z_ratio = np.sum(valid_z_mask) / len(z_values)
 
-        if valid_z_ratio > 0.9:
-            print(f"Found a good location at point {i}. Sampling 10 poses.")
-            for j in range(10):
-                new_orientation = sample_random_orientation()
-                sensor.set_position_orientation(position=point, orientation=new_orientation)
-                for _ in range(5):
-                    og.sim.step()
+        # if valid_z_ratio > 0.95:
+        #     print(f"Found a good location at point {i}. Sampling 10 poses.")
+        #     for j in range(10):
+        #         new_orientation = sample_random_orientation()
+        #         sensor.set_position_orientation(position=point, orientation=new_orientation)
+        #         for _ in range(5):
+        #             og.sim.step()
 
-                new_pos, new_orn = sensor.get_position_orientation()
-                obs, _ = sensor.get_obs()
-                new_rgb_image = copy.deepcopy(obs["rgb"][..., :3].cpu().numpy())
-                new_depth_image = copy.deepcopy(obs["depth_linear"].cpu().numpy().squeeze())
+        #         new_pos, new_orn = sensor.get_position_orientation()
+        #         obs, _ = sensor.get_obs()
+        #         new_rgb_image = copy.deepcopy(obs["rgb"][..., :3].cpu().numpy())
+        #         new_depth_image = copy.deepcopy(obs["depth_linear"].cpu().numpy().squeeze())
+        #         new_seg_instance_id_image = copy.deepcopy(obs["seg_instance_id"].cpu().numpy().squeeze())
 
-                # Filter this new sample based on depth image
-                total_pixels = new_depth_image.size
-                too_close_pixels = np.sum(new_depth_image <= 0.1)
-                too_far_pixels = np.sum(new_depth_image >= 10)
-                if (too_far_pixels / total_pixels) > 0.5 or (too_close_pixels / total_pixels) > 0.5:
-                    print(f"  -> Skipping sample {j} for point {i} due to invalid depth values.")
-                    continue
+        #         # Filter this new sample based on depth image
+        #         total_pixels = new_depth_image.size
+        #         too_close_pixels = np.sum(new_depth_image <= 0.1)
+        #         too_far_pixels = np.sum(new_depth_image >= 10)
+        #         if (too_far_pixels / total_pixels) > 0.5 or (too_close_pixels / total_pixels) > 0.5:
+        #             print(f"  -> Skipping sample {j} for point {i} due to invalid depth values.")
+        #             continue
                 
-                # Save data
-                save_data(valid_sample_count, new_rgb_image, new_depth_image, new_pos, new_orn, rgb_dir, depth_dir, poses_dir)
+        #         # Save data
+        #         save_data(valid_sample_count, new_rgb_image, new_depth_image, new_seg_instance_id_image, new_pos, new_orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir)
                 
-                valid_sample_count += 1
-                time.sleep(0.01)
-        else:
-            print(f"  -> Point {i} is not good (z-ratio: {valid_z_ratio:.2f}). Skipping.")
+        #         valid_sample_count += 1
+        #         time.sleep(0.01)
+        # else:
+        #     print(f"  -> Point {i} is not good (z-ratio: {valid_z_ratio:.2f}). Skipping.")
 
     # Calculate and print point cloud bounds and visualize the full point cloud
     # if all_world_points:

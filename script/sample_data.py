@@ -6,6 +6,7 @@ import argparse
 import random
 import numpy as np
 import open3d as o3d
+import yaml
 
 
 # ---- Recommended environment variables (to mitigate contention for render/replicator/unload) ----
@@ -37,7 +38,7 @@ def get_random_xy_batch(env, n: int):
     Samples n (x,y) coordinates from the scene's AABB.
     """
     x_min, x_max = -25.0, 28.0
-    y_min, y_max = -3.0, 43.0
+    y_min, y_max = -3.0, 32.0 # original size is 43.0
 
     x_coords = np.random.uniform(x_min, x_max, size=(n,))
     y_coords = np.random.uniform(y_min, y_max, size=(n,))
@@ -45,39 +46,11 @@ def get_random_xy_batch(env, n: int):
     return np.stack([x_coords, y_coords], axis=1).astype(np.float32)
 
 
-def sample_z_mixed(n, beta_upper=0.5):
+def sample_z_mixed(n):
     """
-    Samples z coordinates from a mixed distribution.
-    - 80% uniform from [0m, 2.8m]
-    - 20% exponential from [2.8m, 20m] peaked at 2.8m
+    Samples z coordinates uniformly from [0, 2.8].
     """
-    n_lower = int(n * 0.8)
-    n_upper = n - n_lower
-
-    # 1. Lower uniform part
-    z_lower = np.random.uniform(0.0, 2.8, size=n_lower)
-
-    # 2. Upper exponential part
-    z_upper = []
-    while len(z_upper) < n_upper:
-        # Oversample to reduce the number of loops
-        oversample_factor = 1.5
-        num_to_sample = int((n_upper - len(z_upper)) * oversample_factor)
-        if num_to_sample == 0:
-            num_to_sample = 1
-        
-        x = np.random.exponential(scale=beta_upper, size=num_to_sample)
-        z = 2.8 + x
-        valid_z = z[(z >= 2.8) & (z <= 20.0)]
-        z_upper.extend(valid_z.tolist())
-    if z_upper and len(z_upper) > n_upper:
-        z_upper = z_upper[:n_upper]
-
-    # Combine and shuffle
-    z_samples = np.concatenate([z_lower, np.array(z_upper)])
-    np.random.shuffle(z_samples)
-    
-    return z_samples.astype(np.float32)
+    return np.random.uniform(0, 2.8, size=n).astype(np.float32)
 
 
 def sample_free_space_points_batch(env,
@@ -85,13 +58,15 @@ def sample_free_space_points_batch(env,
                                    desired_n: int = 2000,
                                    batch_xy: int = 2000,
                                    radius: float = 0.01,
-                                   xy_mode: str = "traversable"):
+                                   xy_mode: str = "traversable",
+                                   xy_points_from_file=None):
     """
     Samples a large number of free space points.
     - desired_n: The final number of points to obtain
     - batch_xy: Number of (x,y) candidates to generate at once
     - radius: Radius of the sphere for collision checking
-    - xy_mode: "traversable" (from traversable map) or "aabb" (from scene AABB)
+    - xy_mode: "traversable", "aabb", or "file"
+    - xy_points_from_file: NumPy array of (x,y) points if xy_mode is "file"
     """
     results = []
     # Warm-up
@@ -104,6 +79,11 @@ def sample_free_space_points_batch(env,
             xy = get_traversable_xy_batch(trav_map, batch_xy)  # [B,2]
         elif xy_mode == "aabb":
             xy = get_random_xy_batch(env, batch_xy)
+        elif xy_mode == "file":
+            if xy_points_from_file is None:
+                raise ValueError("xy_mode is 'file' but no points were provided via xy_points_from_file.")
+            indices = np.random.choice(xy_points_from_file.shape[0], size=batch_xy, replace=True)
+            xy = xy_points_from_file[indices]
         else:
             raise ValueError(f"Unknown xy_mode: {xy_mode}")
 
@@ -133,7 +113,8 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="Output .ply file path. If not specified, it is automatically generated based on the scene name.")
     parser.add_argument("--batch-xy", type=int, default=2000, help="Number of (x,y) candidates to generate at once")
     parser.add_argument("--radius", type=float, default=0.1, help="Collision check sphere radius")
-    parser.add_argument("--xy-mode", type=str, default="aabb", choices=["traversable", "aabb"], help="xy sampling method")
+    parser.add_argument("--xy-mode", type=str, default="file", choices=["traversable", "aabb", "file"], help="xy sampling method")
+    parser.add_argument("--xy-file", type=str, default="point_cloud_xy.npy", help="Path to .npy file for xy sampling if xy-mode is 'file'")
     
     parser.add_argument("--activity_name", type=str, default="sorting_household_items", help="BEHAVIOR activity to load. If specified, objects for the task will be loaded.")
     parser.add_argument("--activity_definition_id", type=int, default=0, help="Definition ID for the activity.")
@@ -144,6 +125,16 @@ def main():
     if args.seed is not None:
         np.random.seed(args.seed)
         random.seed(args.seed)
+
+    # Load xy points if needed
+    xy_points_from_file = None
+    if args.xy_mode == "file":
+        try:
+            xy_points_from_file = np.load(args.xy_file)
+            print(f"Loaded {xy_points_from_file.shape[0]} (x,y) points from {args.xy_file}")
+        except FileNotFoundError:
+            print(f"Error: --xy-file not found at {args.xy_file}")
+            return
 
     # Scene selection
     available_scenes = get_available_behavior_1k_scenes()
@@ -198,6 +189,7 @@ def main():
         batch_xy=args.batch_xy,
         radius=args.radius,
         xy_mode=args.xy_mode,
+        xy_points_from_file=xy_points_from_file,
     )
 
     og.sim.stop()

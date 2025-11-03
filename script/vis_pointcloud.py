@@ -10,7 +10,7 @@ def main():
     Visualizes an aggregated point cloud from an RGBD dataset.
     """
     parser = argparse.ArgumentParser(description="Visualize a point cloud from an RGBD dataset.")
-    parser.add_argument("--data_dir", type=str, default="mapping/dataset", help="Path to the dataset directory.")
+    parser.add_argument("--data_dir", type=str, default="DATASETS/behavior/processed_data/task-0027/episode_00270010/", help="Path to the dataset directory.")
     args = parser.parse_args()
 
     data_dir = args.data_dir
@@ -29,8 +29,8 @@ def main():
     intrinsics = o3d.camera.PinholeCameraIntrinsic()
     # Assuming image dimensions are 720x720 as in render_data.py
     intrinsics.set_intrinsics(
-        width=720,
-        height=720,
+        width=512,
+        height=512,
         fx=intrinsic_matrix[0, 0],
         fy=intrinsic_matrix[1, 1],
         cx=intrinsic_matrix[0, 2],
@@ -56,7 +56,7 @@ def main():
 
     all_pcds = []
     
-    for i in range(0, len(rgb_files), 20):
+    for i in range(0, len(rgb_files), 100):
         print(f"Processing frame {i+1}/{len(rgb_files)}: {os.path.basename(rgb_files[i])}")
         
         # Load data for the current frame
@@ -94,8 +94,8 @@ def main():
     for pcd in all_pcds:
         combined_pcd += pcd
 
-    print("Downsampling the combined point cloud with a voxel size of 0.1...")
-    downsampled_pcd = combined_pcd.voxel_down_sample(voxel_size=0.1)
+    print("Downsampling the combined point cloud with a voxel size of 0.02...")
+    downsampled_pcd = combined_pcd.voxel_down_sample(voxel_size=0.03)
 
     # Calculate and print the bounding box
     bbox = downsampled_pcd.get_axis_aligned_bounding_box()
@@ -134,6 +134,12 @@ def main():
     output_filename = "point_cloud.html"
     fig.write_html(output_filename)
     print(f"Point cloud visualization saved to {os.path.abspath(output_filename)}")
+
+    # Save the (x, y) coordinates to a numpy file
+    xy_coords = points[:, :2]
+    xy_filename = "point_cloud_xy.npy"
+    np.save(xy_filename, xy_coords)
+    print(f"(x, y) coordinates saved to {os.path.abspath(xy_filename)}")
 
 
 if __name__ == "__main__":

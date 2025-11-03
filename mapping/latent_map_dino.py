@@ -94,7 +94,7 @@ def run_pca_visualization(server, grid, decoder, coords_list, env_name, epoch_la
 
     vertices_vis = torch.cat(coords_list, dim=0).numpy()
 
-    max_points_for_vis = 2000000
+    max_points_for_vis = 4000000
     if vertices_vis.shape[0] > max_points_for_vis:
         print(f"[VIS] Downsampling from {vertices_vis.shape[0]} to {max_points_for_vis} points for PCA visualization.")
         indices = np.random.choice(vertices_vis.shape[0], max_points_for_vis, replace=False)
@@ -105,17 +105,22 @@ def run_pca_visualization(server, grid, decoder, coords_list, env_name, epoch_la
         return
 
     coords_t = torch.from_numpy(vertices_vis).to(device)
+    batch_size = 50000
+    all_feats = []
     with torch.no_grad():
-        voxel_feat = grid.query_voxel_feature(coords_t)
-        feats_t = decoder(voxel_feat)
+        for i in tqdm(range(0, coords_t.shape[0], batch_size), desc="[VIS] Processing features"):
+            batch_coords = coords_t[i:i+batch_size]
+            voxel_feat = grid.query_voxel_feature(batch_coords)
+            feats_t = decoder(voxel_feat)
+            all_feats.append(feats_t.cpu())
 
-    feats_np = feats_t.cpu().numpy()
+    feats_np = torch.cat(all_feats, dim=0).numpy()
     pca = PCA(n_components=3)
     feats_pca = pca.fit_transform(feats_np)
     scaler = MinMaxScaler()
     feats_pca_norm = scaler.fit_transform(feats_pca)
 
-    z_threshold = 2.0
+    z_threshold = 20.0
     vis_mask = vertices_vis[:, 2] <= z_threshold
     filtered_vertices = vertices_vis[vis_mask]
     filtered_colors = feats_pca_norm[vis_mask]
@@ -208,19 +213,19 @@ parser = argparse.ArgumentParser(description="Map a single environment using pre
 parser.add_argument(
     "--dataset-dir",
     type=str,
-    default="mapping/dataset",
+    default="mapping/dataset/sorting_household_items",
     help="Path to the dataset directory."
 )
 parser.add_argument(
     "--poses-dir",
     type=str,
-    default="mapping/dataset/poses",
+    default="mapping/dataset/sorting_household_items/poses",
     help="Path to the directory with .npy pose files."
 )
 parser.add_argument(
     "--output-dir",
     type=str,
-    default="mapping/map_output",
+    default="mapping/map_output/sorting_household_items",
     help="Directory to save the trained grid and decoder."
 )
 parser.add_argument(
@@ -326,8 +331,8 @@ OPT_LR = 1e-3
 # SCENE_MAX = (7.0,  3.0,  3.0)
 
 
-SCENE_MIN = (-7.0, -5.5, -1.0)
-SCENE_MAX = (7.0,  9.5,  3.0)
+SCENE_MIN = (19.0, 19.0, 0.0)
+SCENE_MAX = (26.0,  26.0,  3.0)
 
 
 # --------------------------------------------------------------------------- #
