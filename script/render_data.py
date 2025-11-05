@@ -56,13 +56,17 @@ def main():
     parser = argparse.ArgumentParser(description="Render images from sampled poses.")
     parser.add_argument("--points_file", type=str, default="house_single_floor_points.ply",
                         help="Path to the .ply file containing points.")
-    parser.add_argument("--num_samples", type=int, default=30000,
+    parser.add_argument("--num_samples", type=int, default=10000,
                         help="Number of points to sample and render.")
     parser.add_argument("--scene", type=str, default="house_single_floor", help="Scene model to load. If not specified, will prompt for selection.")
     parser.add_argument("--activity_name", type=str, default="sorting_household_items", help="BEHAVIOR activity to load. If specified, objects for the task will be loaded.")
     parser.add_argument("--activity_definition_id", type=int, default=0, help="Definition ID for the activity.")
     parser.add_argument("--activity_instance_id", type=int, default=0, help="Instance ID for the activity.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
     args = parser.parse_args()
+
+    if args.seed is not None:
+        np.random.seed(args.seed)
     
     server = viser.ViserServer()
 
@@ -86,6 +90,15 @@ def main():
     os.makedirs(depth_dir, exist_ok=True)
     os.makedirs(seg_instance_id_dir, exist_ok=True)
     os.makedirs(poses_dir, exist_ok=True)
+    
+    # Determine the starting frame index by checking existing files
+    start_frame_idx = 0
+    if os.path.exists(rgb_dir):
+        existing_files = [f for f in os.listdir(rgb_dir) if f.endswith('.png')]
+        if existing_files:
+            last_frame = max(int(os.path.splitext(f)[0]) for f in existing_files)
+            start_frame_idx = last_frame + 1
+            print(f"Output directory not empty. Starting from frame index {start_frame_idx}.")
     
     # Configuration for the environment
     config = {
@@ -141,8 +154,8 @@ def main():
         indices = np.random.choice(len(points), args.num_samples, replace=False)
         points = points[indices]
     
-    for _ in range(5):
-        og.sim.step()
+    for _ in range(15):
+        og.sim.render()
     
     # Camera parameters from config and defaults
     image_width = config["env"]["external_sensors"][0]["sensor_kwargs"]["image_width"]
@@ -167,14 +180,15 @@ def main():
 
     all_world_points = []
     all_colors = []
-    valid_sample_count = 0
+    valid_sample_count = start_frame_idx
     for i, point in enumerate(tqdm(points, desc="Processing points")):
         # 1. Get first sample for evaluation
+        robot.set_position_orientation(position=np.array([-1.0, -10.0, 2.0]))
         orientation = sample_random_orientation()
         
         sensor.set_position_orientation(position=point, orientation=orientation)
-        for _ in range(5):
-            og.sim.step()
+        for _ in range(15):
+            og.sim.render()
         
         cur_pos, cur_orn = sensor.get_position_orientation()
         
@@ -185,9 +199,9 @@ def main():
 
         # Filter based on depth image - if view is mostly bad, skip
         total_pixels = depth_image.size
-        too_close_pixels = np.sum(depth_image <= 0.15)
+        too_close_pixels = np.sum(depth_image <= 0.5)
         too_far_pixels = np.sum(depth_image >= 10)
-        if (too_far_pixels / total_pixels) > 0.5 or (too_close_pixels / total_pixels) > 0.5:
+        if (too_far_pixels / total_pixels) > 0.7 or (too_close_pixels / total_pixels) > 0.7:
             print(f"  -> Skipping point {i} due to invalid depth values in initial sample.")
             continue
         

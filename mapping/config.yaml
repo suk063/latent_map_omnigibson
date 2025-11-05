@@ -1,0 +1,61 @@
+# Run settings
+train: True
+continue_training: False
+save_model: True
+run_pca: True
+vis_interval: 1
+num_images: -1 # -1 for all
+
+# Paths
+dataset_dir: "mapping/dataset/sorting_household_items"
+poses_dir: "mapping/dataset/sorting_household_items/poses"
+output_dir: "mapping/map_output/sorting_household_items"
+decoder_path: 
+load_run_dir:
+# load_run_dir: "mapping/map_output/sorting_household_items/runs/sorting_household_items_20251103-235158"
+
+# Dataset settings
+dataset:
+  original_image_size: 512
+
+# Model settings
+model_type: "clip" # "clip" or "dino"
+
+# clip_model:
+#   name: "PE-Core-bigG-14-448"
+#   weights_id: "meta"
+#   image_size: 448
+#   patch_size: 14
+#   feature_dim: 1536
+
+clip_model:
+  name: "EVA02-L-14-336"
+  weights_id: "merged2b_s6b_b61k"
+  image_size: 336
+  patch_size: 14
+  feature_dim: 768
+
+dino_model:
+  weights_path: 'https://dinov3.llamameta.net/dinov3_vith16plus/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth?Policy=eyJTdGF0ZW1lbnQiOlt7InVuaXF1ZV9oYXNoIjoidmJ5bmdvajZodGpsbm4wNWxrd2k2NmphIiwiUmVzb3VyY2UiOiJodHRwczpcL1wvZGlub3YzLmxsYW1hbWV0YS5uZXRcLyoiLCJDb25kaXRpb24iOnsiRGF0ZUxlc3NUaGFuIjp7IkFXUzpFcG9jaFRpbWUiOjE3NTk5NTEzNzl9fX1dfQ__&Signature=BBa0wwRRMwQKyPOqlOWi6VBJSyCEK79q9aCq%7E-MvaWPl8b%7EkQHIlzOUmKzb%7EwD1KRBgugXxGQn13x3AlV3IZnc2XVuBPmWp7eGO5ymhH6LdWgeAuLk%7Ei0bUeqr3AOWlzD3x0rKBxTDDIf-DQv0gBmSRt0IJ4edaTTcfUyDdQiRnYB6eJ2B7gz7JrnzoXtRqP5GzrtOU4nghQ3-p2ckP6zuHMUgzt4keWZoF3kekvTYqIMjmwzizDI5qm-7%7E4vYetRXpxbghCwiqiKiriYzJqm0eZys0NdW8dFfTCsHHfYd9bqE-etNrQcQffUOfUcgrqvTF7B61f5vonsQzvaznn1g__&Key-Pair-Id=K15QRJLYKIFSLZ&Download-Request-ID=1788493205366156'
+  image_size: 256
+  patch_size: 16
+
+grid:
+  levels: 2
+  feature_dim: 64
+  level_scale: 2.0
+  hash_table_size: 2097152 # 2**21
+  resolution: 0.1
+
+decoder:
+  hidden_dim: 256
+
+# Training settings
+training:
+  epochs: 30
+  optimizer_lr: 0.001
+  log_interval: 100
+
+# Scene settings
+scene_min: [19.0, 19.0, -1.0]
+scene_max: [26.0,  27.0,  3.0]
