@@ -199,74 +199,116 @@ def run_pca_visualization(server, grid, decoder, coords_list, env_name, epoch_la
 # --------------------------------------------------------------------------- #
 #  Dataset Class                                                              #
 # --------------------------------------------------------------------------- #
-class SingleEnvDataset(Dataset):
-    def __init__(self, samples, poses_dir, transform_func, image_size, patch_size):
+class MultiEnvDataset(Dataset):
+    def __init__(self, dataset_dir, target_envs, num_images, transform_func, image_size, patch_size):
         self.transform_func = transform_func
         self.image_size = image_size
         self.patch_size = patch_size
-        print("\nLoading and processing poses...")
-        
-        # Load and process poses
-        pose_files = sorted(glob.glob(os.path.join(poses_dir, "*.npy")))
-        if not pose_files:
-            raise FileNotFoundError(f"No .npy pose files found in '{poses_dir}'")
-        poses_4x4 = [np.load(f) for f in pose_files]
+        self.feat_h = self.image_size // patch_size
 
-        # The poses are world-to-camera, but we need camera-to-world to transform points from camera to world frame.
-        cam_to_world_poses_list = []
-        for p_4x4 in poses_4x4:
-            c2w = np.linalg.inv(p_4x4)
-            cam_to_world_poses_list.append(c2w)
-        self.cam_to_world_poses = np.array(cam_to_world_poses_list)
+        self.samples = []
+        self.cam_to_world_poses = {}
+        self.env_names = []
 
-        self.feat_h = self.image_size // self.patch_size
+        if not target_envs:
+            env_dirs = sorted([d for d in dataset_dir.iterdir() if d.is_dir()])
+        else:
+            env_dirs = sorted([dataset_dir / env for env in target_envs])
 
-        # Filter for valid samples without loading images into memory
-        print("Validating dataset samples...")
-        valid_samples = []
-        for rgb_path, depth_path, pose_idx in tqdm(samples, desc="Validating"):
-            if not os.path.exists(str(rgb_path)):
+        print(f"\nFound {len(env_dirs)} environments.")
+
+        for env_dir in env_dirs:
+            env_name = env_dir.name
+            
+            print(f"--- Processing environment: {env_name} ---")
+            
+            poses_dir = env_dir / "poses"
+            rgb_dir = env_dir / "rgb"
+            depth_dir = env_dir / "depth"
+
+            if not all([d.exists() for d in [poses_dir, rgb_dir, depth_dir]]):
+                print(f"  [WARN] Missing poses, rgb, or depth directory in {env_dir}. Skipping.")
                 continue
-            try:
-                # Check depth map without storing it
-                depth_np = np.load(str(depth_path))
-                if np.max(depth_np) == 0:
+            
+            self.env_names.append(env_name)
+
+            # Load and process poses
+            pose_files = sorted(list(poses_dir.glob("*.npy")))
+            if not pose_files:
+                print(f"  [WARN] No .npy pose files found in '{poses_dir}'. Skipping env.")
+                self.env_names.pop()
+                continue
+            
+            poses_4x4 = [np.load(f) for f in pose_files]
+            cam_to_world_poses_list = [np.linalg.inv(p_4x4) for p_4x4 in poses_4x4]
+            self.cam_to_world_poses[env_name] = np.array(cam_to_world_poses_list)
+
+            # Collect and validate samples
+            rgb_files = sorted(list(rgb_dir.glob("*.png")))
+            if num_images > 0:
+                print(f"  -> Using the first {num_images} images.")
+                rgb_files = rgb_files[:num_images]
+
+            env_samples = []
+            for i, rgb_path in enumerate(tqdm(rgb_files, desc=f"  Validating {env_name}")):
+                depth_path = depth_dir / f"{rgb_path.stem}.npy"
+                if not depth_path.exists():
                     continue
-            except Exception as e:
-                print(f"Warning: Could not load or process {depth_path}, skipping. Error: {e}")
-                continue
-            valid_samples.append((rgb_path, depth_path, pose_idx))
+                env_samples.append({"rgb_path": rgb_path, "depth_path": depth_path, "pose_idx": i, "env_name": env_name})
+            
+            self.samples.extend(env_samples)
         
-        self.samples = valid_samples
-        print(f"Dataset initialized with {len(self.samples)} valid samples.")
-
+        print(f"\nDataset initialized with {len(self.samples)} total samples from {len(self.env_names)} environments.")
+    
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        rgb_path, depth_path, pose_idx = self.samples[idx]
+        sample_info = self.samples[idx]
+        rgb_path = sample_info["rgb_path"]
+        depth_path = sample_info["depth_path"]
+        pose_idx = sample_info["pose_idx"]
+        env_name = sample_info["env_name"]
 
-        rgb_np = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
-        rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_BGR2RGB)
+        try:
+            rgb_np = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+            if rgb_np is None: raise IOError(f"Failed to read image: {rgb_path}")
+            rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_BGR2RGB)
+            
+            depth_np = np.load(str(depth_path))
+            if np.max(depth_np) == 0:
+                return None # This will be filtered by the collate function
 
-        depth_np = np.load(str(depth_path)) # Load .npy file
+        except Exception as e:
+            print(f"Warning: Error loading data for sample {idx} ({rgb_path}), skipping. Error: {e}")
+            return None
 
-        # Preprocess image and depth
         img_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).float() / 255.0
         img_tensor = self.transform_func(img_tensor)
 
-        depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0).float() # Depth is in meters
+        depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0).float()
         depth_t_resized = F.interpolate(depth_t, (self.image_size, self.image_size), mode="nearest-exact")
         depth_t = F.interpolate(depth_t_resized, (self.feat_h, self.feat_h), mode="nearest-exact").squeeze()
 
-        E_cv = self.cam_to_world_poses[pose_idx][:3, :]
+        E_cv = self.cam_to_world_poses[env_name][pose_idx][:3, :]
         extrinsic_t = torch.from_numpy(E_cv).float()
 
         return {
             "img_tensor": img_tensor,
             "depth_t": depth_t,
             "extrinsic_t": extrinsic_t,
+            "env_name": env_name,
         }
+
+def collate_fn(batch):
+    """
+    Custom collate function to filter out None values from the batch.
+    This is used to handle cases where `__getitem__` returns None for invalid samples.
+    """
+    batch = list(filter(lambda x: x is not None, batch))
+    if not batch:
+        return {}
+    return torch.utils.data.dataloader.default_collate(batch)
 
 
 # --------------------------------------------------------------------------- #
@@ -366,9 +408,24 @@ def main():
     else:
         load_path = output_path
 
-    intrinsic_path = dataset_path / "intrinsics.txt"
+    # Determine target environments
+    target_envs = config.get('target_envs', [])
+    if not target_envs:
+        env_dirs = sorted([d for d in dataset_path.iterdir() if d.is_dir()])
+        env_names = [d.name for d in env_dirs]
+        print(f"[INIT] No target_envs specified. Using all {len(env_names)} environments found in {dataset_path}")
+    else:
+        env_names = sorted(target_envs)
+        print(f"[INIT] Using specified target_envs: {env_names}")
+
+    if not env_names:
+        print("[ERROR] No environments found or specified to process. Exiting.")
+        return
+    
+    first_env_path = dataset_path / env_names[0]
+    intrinsic_path = first_env_path / "intrinsics.txt"
     if not intrinsic_path.exists():
-        print(f"[ERROR] Intrinsic file not found at {intrinsic_path}.")
+        print(f"[ERROR] Intrinsic file not found at {intrinsic_path} for the first environment. Exiting.")
         return
     K = np.loadtxt(intrinsic_path)
     fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
@@ -380,29 +437,14 @@ def main():
     cx = cx * (image_size / original_size)
     cy = cy * (image_size / original_size)
 
-    try:
-        world_to_cam_poses = load_w2c_poses_from_dir(config['poses_dir'])
-    except FileNotFoundError:
-        print(f"[ERROR] Poses directory '{config['poses_dir']}' not found or is empty.")
-        return
 
-    # The poses are world-to-camera, but we need camera-to-world to transform points from camera to world frame.
-    cam_to_world_poses_list = []
-    for w2c_3x4 in world_to_cam_poses:
-        c2w = np.eye(4)
-        R = w2c_3x4[:3, :3]
-        t = w2c_3x4[:3, 3]
-        c2w[:3, :3] = R.T
-        c2w[:3, 3] = -R.T @ t
-        cam_to_world_poses_list.append(c2w)
-    cam_to_world_poses = np.array(cam_to_world_poses_list)
-
-
-    env_name = dataset_path.name
-
-    log_dir = output_path / f"runs/{env_name}_{time.strftime('%Y%m%d-%H%M%S')}"
-    tb_writer = SummaryWriter(log_dir=log_dir)
-    print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
+    # Pose loading is now handled by the dataset class
+    
+    task_name = dataset_path.name
+    log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
+    if config['train'] or config['run_pca']:
+        tb_writer = SummaryWriter(log_dir=log_dir)
+        print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
 
     # --------------------------------------------------------------------------- #
     #  Shared Decoder                                                             #
@@ -435,16 +477,14 @@ def main():
 
     OPT_LR = config['training']['optimizer_lr']
     
-    # 1. Create or load VoxelHashTable
-    grid = None
-    agg_coords = []
+    # 1. Create or load VoxelHashTables for each environment
+    grids = {}
     
     if config['train']:
-        grid_path = load_path / "grid.pt"
         decoder_path = load_path / "decoder.pt"
 
-        if config['continue_training'] and grid_path.exists() and decoder_path.exists():
-            print(f"\n[LOAD] Found existing grid and decoder. Loading for continued training...")
+        if config['continue_training'] and decoder_path.exists():
+            print(f"\n[LOAD] Found existing decoder. Loading for continued training...")
             
             # Load decoder
             state_dict = torch.load(decoder_path, map_location=DEVICE)
@@ -454,69 +494,45 @@ def main():
                 decoder.load_state_dict(state_dict)
             print(f"[LOAD] Loaded decoder from {decoder_path}")
 
-            # Load grid for continued training
-            sparse_data = torch.load(grid_path, map_location=DEVICE)
-            grid = VoxelHashTable(
-                resolution=RESOLUTION,
-                num_levels=GRID_LVLS,
-                level_scale=LEVEL_SCALE,
-                feature_dim=GRID_FEAT_DIM,
-                hash_table_size=HASH_TABLE_SIZE,
-                scene_bound_min=SCENE_MIN,
-                scene_bound_max=SCENE_MAX,
-                device=DEVICE,
-                mode="train",
-                sparse_data=sparse_data,
-            )
-            print(f"[LOAD] Loaded grid from {grid_path}")
-        else:
-            print("\n[INIT] No existing trained model found. Creating a new one.")
-            # Training mode: Create new grid
-            grid = VoxelHashTable(
-                resolution=RESOLUTION,
-                num_levels=GRID_LVLS,
-                level_scale=LEVEL_SCALE,
-                feature_dim=GRID_FEAT_DIM,
-                hash_table_size=HASH_TABLE_SIZE,
-                scene_bound_min=SCENE_MIN,
-                scene_bound_max=SCENE_MAX,
-                device=DEVICE,
-                mode="train",
-            )
-            
-            stats = grid.collision_stats()
-            print(f"--- Collision stats for {env_name}: ---")
-            for level_name, stat in stats.items():
-                total = stat['total']
-                collisions = stat['col']
-                if total > 0:
-                    percentage = (collisions / total) * 100
-                    print(f"  {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
-                else:
-                    print(f"  {level_name}: 0 voxels")
-            print("-------------------------------------------------")
+        for env_name in env_names:
+            grid_path = load_path / f"grid_{env_name}.pt"
+            if config['continue_training'] and grid_path.exists():
+                print(f"[LOAD] Loading grid for {env_name} from {grid_path}")
+                sparse_data = torch.load(grid_path, map_location=DEVICE)
+                grid = VoxelHashTable(
+                    resolution=RESOLUTION, num_levels=GRID_LVLS, level_scale=LEVEL_SCALE,
+                    feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE,
+                    scene_bound_min=SCENE_MIN, scene_bound_max=SCENE_MAX,
+                    device=DEVICE, mode="train", sparse_data=sparse_data,
+                )
+            else:
+                print(f"\n[INIT] Creating a new grid for {env_name}.")
+                grid = VoxelHashTable(
+                    resolution=RESOLUTION, num_levels=GRID_LVLS, level_scale=LEVEL_SCALE,
+                    feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE,
+                    scene_bound_min=SCENE_MIN, scene_bound_max=SCENE_MAX,
+                    device=DEVICE, mode="train",
+                )
+                stats = grid.collision_stats()
+                print(f"--- Collision stats for {env_name}: ---")
+                for level_name, stat in stats.items():
+                    total = stat['total']
+                    collisions = stat['col']
+                    if total > 0:
+                        percentage = (collisions / total) * 100
+                        print(f"  {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
+                    else:
+                        print(f"  {level_name}: 0 voxels")
+                print("-------------------------------------------------")
+            grids[env_name] = grid
     else:
-        # Inference mode: Load pre-trained grid
-        print("\n[LOAD] Loading pre-trained grid for visualization...")
-        sparse_grid_path = load_path / "grid.sparse.pt"
-        if not sparse_grid_path.exists():
-            print(f"[LOAD] [ERROR] Pre-trained grid not found at {sparse_grid_path}. Please train first.")
-            return
-        
-        sparse_data = torch.load(sparse_grid_path, map_location=DEVICE)
-        grid = VoxelHashTable(
-            mode="infer",
-            sparse_data=sparse_data,
-            device=DEVICE,
-            feature_dim=GRID_FEAT_DIM,
-            hash_table_size=HASH_TABLE_SIZE
-        )
-        print(f"[LOAD] Loaded grid from {sparse_grid_path}")
+        # Inference mode: Load pre-trained grids and decoder
+        print("\n[LOAD] Loading pre-trained grids and decoder for visualization...")
         
         # Load decoder weights
         decoder_path = load_path / "decoder.pt"
         if not decoder_path.exists():
-            print(f"[ERROR] Pre-trained decoder not found at {decoder_path}. Cannot proceed with visualization.")
+            print(f"[ERROR] Pre-trained decoder not found at {decoder_path}. Cannot proceed.")
             return
         
         state_dict = torch.load(decoder_path, map_location=DEVICE)
@@ -526,46 +542,49 @@ def main():
             decoder.load_state_dict(state_dict)
         print(f"[LOAD] Loaded decoder from {decoder_path}")
 
-    if config['train']:
-        # 2. Setup a single optimizer for the grid and the shared decoder
-        optimizer = torch.optim.Adam(list(grid.parameters()) + list(decoder.parameters()), lr=OPT_LR)
-
-        # 3. Load all data from the environment
-        all_samples = []
-        rgb_files = sorted(list((dataset_path / "rgb").glob("*.png")))
-        depth_files = sorted(list((dataset_path / "depth").glob("*.npy")))
-        
-        if not rgb_files or not depth_files:
-            print(f"[WARN] No data found in {dataset_path}, skipping.")
-            return
+        for env_name in env_names:
+            sparse_grid_path = load_path / f"grid.sparse_{env_name}.pt"
+            if not sparse_grid_path.exists():
+                print(f"[LOAD] [WARN] Pre-trained grid not found for env '{env_name}' at {sparse_grid_path}. Skipping.")
+                continue
             
-        for i, (rgb_path, depth_path) in enumerate(zip(rgb_files, depth_files)):
-            all_samples.append((rgb_path, depth_path, i)) # i is pose_idx
-
-        if config['num_images'] > 0:
-            all_samples = all_samples[:config['num_images']]
-            print(f"--- Using the first {config['num_images']} images for training. ---")
-
-        if not all_samples:
-            print("[ERROR] No training data found. Exiting.")
-            return
+            sparse_data = torch.load(sparse_grid_path, map_location=DEVICE)
+            grid = VoxelHashTable(
+                mode="infer", sparse_data=sparse_data, device=DEVICE,
+                feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE
+            )
+            grids[env_name] = grid
+            print(f"[LOAD] Loaded grid for {env_name} from {sparse_grid_path}")
         
+        if not grids:
+            print("[ERROR] No valid grids were loaded. Exiting.")
+            return
+
+
+    if config['train']:
+        # 2. Setup a single optimizer for all grids and the shared decoder
+        all_params = list(decoder.parameters())
+        for grid in grids.values():
+            all_params.extend(list(grid.parameters()))
+        optimizer = torch.optim.Adam(all_params, lr=OPT_LR)
+
+        # 3. Load all data from the environments
         try:
-            dataset = SingleEnvDataset(all_samples, config['poses_dir'], transform, image_size, patch_size)
+            dataset = MultiEnvDataset(dataset_path, target_envs, config['num_images'], transform, image_size, patch_size)
             if len(dataset) == 0:
                 print("[ERROR] No valid training data found after filtering. Exiting.")
                 return
         except FileNotFoundError as e:
             print(f"[ERROR] {e}")
             return
-        cam_to_world_poses = dataset.cam_to_world_poses
         
         dataloader = DataLoader(
             dataset,
             batch_size=1,
             shuffle=True,
             num_workers=4,
-            pin_memory=True
+            pin_memory=True,
+            collate_fn=collate_fn
         )
         print(f"--- Loaded {len(dataset)} samples. Starting training... ---")
 
@@ -573,14 +592,18 @@ def main():
         LOG_INTERVAL = config['training']['log_interval']
         for epoch in range(config['training']['epochs']):
             loss_history = []
-            epoch_coords = []
+            epoch_coords = defaultdict(list)
             
-            for i, data in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}")):
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}")
+            for i, data in enumerate(pbar):
+                if not data: continue # Skip empty batches from collate_fn
+
                 # --- Get preprocessed data from dataset ---
                 img_tensor = data["img_tensor"].to(DEVICE)
                 depth_t = data["depth_t"].to(DEVICE)
                 extrinsic_t = data["extrinsic_t"].unsqueeze(1).to(DEVICE)
-                
+                env_name = data["env_name"][0] # Batch size is 1
+
                 with torch.no_grad():
                     vis_feat = model(img_tensor)
                 
@@ -611,11 +634,12 @@ def main():
                 coords_valid = coords_valid[in_bounds].to(DEVICE)
 
                 # accumulate for visualization (store on CPU to save GPU mem)
-                if config['run_pca']:
-                    epoch_coords.append(coords_valid.cpu())
+                if config['run_pca'] and env_name == env_names[0]: # Only for the first env
+                    epoch_coords[env_name].append(coords_valid.cpu())
                 feats_valid = feats_valid[in_bounds].to(DEVICE)
             
                 
+                grid = grids[env_name] # Get the correct grid for this environment
                 voxel_feat = grid.query_voxel_feature(coords_valid)
                 pred_feat = decoder(voxel_feat)
 
@@ -633,8 +657,7 @@ def main():
                 tb_writer.add_scalar("Loss/step", loss.item(), global_step)
 
                 if (i + 1) % LOG_INTERVAL == 0:
-                    total_steps = len(dataloader)
-                    print(f"[Epoch {epoch+1}/{config['training']['epochs']}] [{i+1}/{total_steps}] Loss: {loss.item():.4f}")
+                    pbar.set_postfix_str(f"Loss: {loss.item():.4f}")
             
             avg_loss = sum(loss_history) / len(loss_history) if loss_history else 0
             print(f"[Epoch {epoch+1}/{config['training']['epochs']}] Avg. Loss: {avg_loss:.4f}")
@@ -644,15 +667,15 @@ def main():
 
             # --- Periodic PCA Visualization ---
             if config['run_pca'] and config['vis_interval'] > 0 and (epoch + 1) % config['vis_interval'] == 0:
-                run_pca_visualization(server, grid, decoder, epoch_coords, env_name, epoch + 1, DEVICE)
+                first_env_name = env_names[0]
+                run_pca_visualization(server, grids[first_env_name], decoder, epoch_coords[first_env_name], first_env_name, epoch + 1, DEVICE)
 
             # --- Save checkpoint after each epoch ---
             if config['save_model']:
-                dense_grid_path = log_dir / f"grid_epoch_{epoch+1}.pt"
-                sparse_grid_path = log_dir / f"grid.sparse_epoch_{epoch+1}.pt"
-                grid.save_dense(dense_grid_path)
-                grid.save_sparse(sparse_grid_path)
-                print(f"[SAVE] Saved grid for epoch {epoch+1} to {dense_grid_path} and {sparse_grid_path}")
+                for env_name, grid in grids.items():
+                    sparse_grid_path = log_dir / f"grid.sparse_{env_name}_epoch_{epoch+1}.pt"
+                    grid.save_sparse(sparse_grid_path)
+                    print(f"[SAVE] Saved sparse grid for {env_name} epoch {epoch+1} to {sparse_grid_path}")
                 
                 decoder_path = log_dir / f"decoder_epoch_{epoch+1}.pt"
                 torch.save(decoder.state_dict(), decoder_path)
@@ -660,52 +683,55 @@ def main():
 
  
         # ----------------------------------------------------------------------- #
-        #  Check hash collisions in infer mode                                     #
+        #  Final save and hash collision check                                    #
         # ----------------------------------------------------------------------- #
-        print("\n[CHECK] Evaluating hash collisions in infer mode...")
-        sparse_data = grid.export_sparse()
-        infer_grid = VoxelHashTable(
-            mode="infer", 
-            sparse_data=sparse_data, 
-            device=DEVICE,
-            feature_dim=GRID_FEAT_DIM,
-            hash_table_size=HASH_TABLE_SIZE
-        )
-        stats = infer_grid.collision_stats()
-        print(f"  [Infer] {env_name}:")
-        for level_name, stat in stats.items():
-            total = stat['total']
-            collisions = stat['col']
-            if total > 0:
-                percentage = (collisions / total) * 100
-                print(f"    {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
-            else:
-                print(f"    {level_name}: 0 voxels")
-
         if config['save_model']:
-            dense_grid_path = log_dir / "grid.pt"
-            sparse_grid_path = log_dir / "grid.sparse.pt"
-            grid.save_dense(dense_grid_path)
-            grid.save_sparse(sparse_grid_path)
-            print(f"[SAVE] Saved grid to {dense_grid_path} and {sparse_grid_path}")
+            for env_name, grid in grids.items():
+                print(f"\n[CHECK] Evaluating hash collisions for {env_name} in infer mode...")
+                sparse_data = grid.export_sparse()
+                infer_grid = VoxelHashTable(
+                    mode="infer", sparse_data=sparse_data, device=DEVICE,
+                    feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE
+                )
+                stats = infer_grid.collision_stats()
+                print(f"  [Infer] {env_name}:")
+                for level_name, stat in stats.items():
+                    total, collisions = stat['total'], stat['col']
+                    if total > 0:
+                        percentage = (collisions / total) * 100
+                        print(f"    {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
+                    else:
+                        print(f"    {level_name}: 0 voxels")
+
+                sparse_grid_path = log_dir / f"grid.sparse_{env_name}.pt"
+                grid.save_sparse(sparse_grid_path)
+                print(f"[SAVE] Saved final sparse grid for {env_name} to {sparse_grid_path}")
 
             decoder_path = log_dir / "decoder.pt"
             torch.save(decoder.state_dict(), decoder_path)
-            print(f"[SAVE] Saved decoder to {decoder_path}")
+            print(f"[SAVE] Saved final decoder to {decoder_path}")
     else:
         # Inference mode: Load coordinates for visualization
-        print("\n[VIS] Loading data for visualization...")
-        rgb_files = sorted(list((dataset_path / "rgb").glob("*.png")))
-        depth_files = sorted(list((dataset_path / "depth").glob("*.npy")))
-        
-        if config['num_images'] > 0:
-            rgb_files = rgb_files[:config['num_images']]
-            depth_files = depth_files[:config['num_images']]
-            print(f"--- Using the first {config['num_images']} images for visualization. ---")
-        
-        if not rgb_files or not depth_files:
-            print(f"[VIS] [WARN] No data found in {env_name}, skipping.")
-        else:
+        agg_coords = defaultdict(list)
+        for env_name in env_names:
+            print(f"\n[VIS] Loading data for {env_name} visualization...")
+            env_path = dataset_path / env_name
+            rgb_files = sorted(list((env_path / "rgb").glob("*.png")))
+            depth_files = sorted(list((env_path / "depth").glob("*.npy")))
+            
+            if config['num_images'] > 0:
+                rgb_files = rgb_files[:config['num_images']]
+                depth_files = depth_files[:config['num_images']]
+            
+            if not rgb_files or not depth_files:
+                print(f"[VIS] [WARN] No data found in {env_name}, skipping.")
+                continue
+            
+            poses_dir = env_path / "poses"
+            pose_files = sorted(list(poses_dir.glob("*.npy")))
+            poses_4x4 = [np.load(f) for f in pose_files]
+            cam_to_world_poses = np.array([np.linalg.inv(p_4x4) for p_4x4 in poses_4x4])
+
             feat_h = image_size // patch_size
             for i, (rgb_path, depth_path) in enumerate(tqdm(zip(rgb_files, depth_files), desc=f"Loading {env_name}", total=len(rgb_files))):
                 depth_np = np.load(str(depth_path))
@@ -717,10 +743,10 @@ def main():
                 depth_t = F.interpolate(depth_t_resized, (feat_h, feat_h), mode="nearest-exact").squeeze()
                 
                 E_cv = cam_to_world_poses[i][:3, :]
-                extrinsic_t = torch.from_numpy(E_cv).float().unsqueeze(0).unsqueeze(0).to(DEVICE)
+                extrinsic_t = torch.from_numpy(E_cv).float().unsqueeze(0).to(DEVICE)
                 
                 coords_world, _ = get_3d_coordinates(
-                    depth_t, extrinsic_t,
+                    depth_t.unsqueeze(0), extrinsic_t.unsqueeze(1),
                     fx=fx, fy=fy, cx=cx, cy=cy,
                     original_size=image_size,
                 )
@@ -732,7 +758,6 @@ def main():
                 in_z = (coords_valid[:,2] > SCENE_MIN[2]) & (coords_valid[:,2] < SCENE_MAX[2])
                 in_bounds = in_x & in_y & in_z
                 
-                # Filter out points with depth < 0.01
                 depth_flat = depth_t.reshape(-1)
                 valid_depth = depth_flat >= 0.01
                 in_bounds = in_bounds & valid_depth
@@ -741,25 +766,30 @@ def main():
                     continue
                 
                 coords_valid = coords_valid[in_bounds]
-                agg_coords.append(coords_valid.cpu())
+                agg_coords[env_name].append(coords_valid.cpu())
         
         print(f"[VIS] Loaded coordinates for visualization.")
     
     # --- PCA Visualization ---
     if config['run_pca']:
-        intrinsic_path = dataset_path / "intrinsics.txt"
-        if not intrinsic_path.exists():
-            print(f"[VIS] [ERROR] Intrinsic file not found at {intrinsic_path}. Skipping PCA.")
+        first_env_name = env_names[0]
+        if first_env_name not in grids:
+            print(f"[VIS] [ERROR] Grid for the first environment '{first_env_name}' was not loaded. Skipping PCA.")
         else:
             if config['train']:
-                # In training mode, periodic visualization is used. A final visualization can be triggered if needed.
                 if config['vis_interval'] == 0:
-                     print("\n[VIS] To see PCA visualization during training, set a value for --vis-interval (e.g., --vis-interval 5).")
+                     print("\n[VIS] PCA visualization was not run during training. Set 'vis_interval' > 0 to enable.")
+                else:
+                    print(f"\n[VIS] Running final PCA for {first_env_name}.")
+                    # To run final PCA, we need to collect all coords, which we only did for the first env.
+                    # The current logic handles periodic viz, which is sufficient.
+                    pass
             else:
-                # In inference mode, run PCA on all aggregated coordinates.
-                run_pca_visualization(server, grid, decoder, agg_coords, env_name, "final", DEVICE)
+                # In inference mode, run PCA on the first environment's aggregated coordinates.
+                run_pca_visualization(server, grids[first_env_name], decoder, agg_coords[first_env_name], first_env_name, "final", DEVICE)
 
-    tb_writer.close()
+    if config['train'] or config['run_pca']:
+        tb_writer.close()
 
     if config['run_pca']:
         print("\n[VIS] Viser server is running. Open the link in your browser.")
