@@ -178,6 +178,7 @@ def build_scene_from_hdf5(
     task_id: int,
     demo_id: int,
     args,
+    sampling_rate: int,
     flush_every_n_steps: int = 500,
 ) -> None:
     task_name = TASK_INDICES_TO_NAMES[task_id]
@@ -217,20 +218,37 @@ def build_scene_from_hdf5(
         "sensor_type": "VisionSensor",
         "modalities": modalities,
         "sensor_kwargs": {
-            "image_height": 336,
-            "image_width": 336,
+            "image_height": 512,
+            "image_width": 512,
         },
         "position": [0, 0, 1.5],
         "orientation": [0, 0, 0, 1],
     }]
     
-    start_frame_idx = 0
+    sorted_pose_files = sorted(pose_files)
+    num_poses = len(sorted_pose_files)
+
+    # Determine where to start saving, based on sequentially named existing files
+    start_save_idx = 0
     if os.path.exists(rgb_dir):
         existing_files = [f for f in os.listdir(rgb_dir) if f.endswith('.png')]
         if existing_files:
-            last_frame = max(int(os.path.splitext(f)[0]) for f in existing_files)
-            start_frame_idx = last_frame + 1
-            print(f"Output directory not empty. Starting from frame index {start_frame_idx}.")
+            try:
+                last_saved_idx = max(int(os.path.splitext(f)[0]) for f in existing_files)
+                start_save_idx = last_saved_idx + 1
+            except ValueError:
+                # No valid file names found
+                start_save_idx = 0
+    
+    if start_save_idx > 0:
+        print(f"Output directory not empty. Starting from save index {start_save_idx}.")
+
+    # The loop for iterating through poses should start at the corresponding sampled index
+    start_frame_idx = start_save_idx * sampling_rate
+
+    if start_frame_idx >= num_poses:
+        log.info(f"All {num_poses // sampling_rate} frames have been generated.")
+        return
 
     # Get the full scene file path, following the logic in replay_obs.py
     # This is the correct way to load the scene for playback.
@@ -283,11 +301,13 @@ def build_scene_from_hdf5(
     intrinsics_path = os.path.join(data_dir, "intrinsics.txt")
     np.savetxt(intrinsics_path, intrinsics)
 
-    sorted_pose_files = sorted(pose_files)
-    num_poses = len(sorted_pose_files)
+    save_idx = start_save_idx
+    
+    # Correctly calculate the number of items for tqdm
+    num_to_render = (num_poses - start_frame_idx + sampling_rate - 1) // sampling_rate
 
-    with tqdm(total=num_poses, desc="Generating samples", initial=start_frame_idx) as pbar:
-        for frame_idx in range(start_frame_idx, num_poses):
+    with tqdm(total=num_to_render, desc="Generating samples") as pbar:
+        for frame_idx in range(start_frame_idx, num_poses, sampling_rate):
             pose_file = sorted_pose_files[frame_idx]
 
             # 1. Load a pose from the pre-generated list
@@ -311,11 +331,12 @@ def build_scene_from_hdf5(
             seg_instance_id_image = copy.deepcopy(obs["seg_instance_id"].cpu().numpy().squeeze())
 
             # Save the sample
-            save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, cur_pos, cur_orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir)
+            save_data(save_idx, rgb_image, depth_image, seg_instance_id_image, cur_pos, cur_orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir)
+            save_idx += 1
             pbar.update(1)
             time.sleep(0.01)
 
-    log.info(f"Data generation complete. Saved {num_poses - start_frame_idx} new samples. Total samples: {num_poses}.")
+    log.info(f"Data generation complete. Saved {save_idx - start_save_idx} new samples. Total samples in dir: {save_idx}.")
 
 
 def main():
@@ -325,6 +346,7 @@ def main():
     parser.add_argument("--demo_id", type=int, default=210170, help="Demo ID.")
     parser.add_argument("--xy_file", type=str, default="point_cloud_xy.npy", help="Path to .npy file for xy sampling.")
     parser.add_argument("--radius", type=float, default=0.1, help="Collision check sphere radius")
+    parser.add_argument("--sampling_rate", type=int, default=10, help="The rate at which to sample the frames.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
     args = parser.parse_args()
     
@@ -336,6 +358,7 @@ def main():
         task_id=args.task_id,
         demo_id=args.demo_id,
         args=args,
+        sampling_rate=args.sampling_rate,
     )
 
     log.info(f"Data saved to {os.path.join('mapping/dataset', f'task-{args.task_id:04d}', f'episode_{args.demo_id:08d}')}")

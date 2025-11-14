@@ -42,14 +42,6 @@ def main():
         print(f"Error: Data directory not found or incomplete. {e}")
         return
 
-    if not (len(rgb_files) == len(depth_files) == len(pose_files) == len(seg_instance_id_files)):
-        print("Error: The number of rgb, depth, pose, and instance segmentation files must be the same.")
-        return
-    
-    if not rgb_files:
-        print("Error: No data found in the specified directory.")
-        return
-
     all_pcds_rgb = []
     all_points_instance_list = []
     all_colors_instance_list = []

@@ -23,6 +23,9 @@ log = create_module_logger(module_name="replay_obs")
 log.setLevel(20)
 
 gm.RENDER_VIEWER_CAMERA = False
+# gm.ENABLE_HQ_RENDERING = False
+gm.HEADLESS = True
+
 gm.DEFAULT_VIEWER_WIDTH = 128
 gm.DEFAULT_VIEWER_HEIGHT = 128
 gm.ENABLE_TRANSITION_RULES = False
@@ -35,6 +38,7 @@ def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, pos, orn
     imageio.imwrite(os.path.join(rgb_dir, f"{frame_filename_base}.png"), rgb_image)
     np.save(os.path.join(depth_dir, f"{frame_filename_base}.npy"), depth_image)
     np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image)
+    # np.save(os.path.join(flow_dir, f"{frame_filename_base}.npy"), flow_image)
     
     # Construct and save the extrinsic matrix in OpenCV format (world-to-camera)
     R_world_og = Rotation.from_quat(orn.cpu().numpy()).as_matrix()
@@ -91,6 +95,7 @@ class BehaviorDataPlaybackWrapper(DataPlaybackWrapper):
                     rgb_image = obs[f"{camera_name}::rgb"][..., :3].cpu().numpy().copy()
                     depth = obs[f"{camera_name}::depth_linear"].cpu().numpy().squeeze()
                     seg = obs[f"{camera_name}::seg_instance_id"].cpu().numpy().squeeze()
+                    # flow = obs[f"{camera_name}::flow"].cpu().numpy().squeeze()
                     pos, orn = cam_pose
                     cam_dirs = self.cam_data_dirs[camera_name]
                     save_data(self.frame_idx, rgb_image, depth, seg, pos, orn,
@@ -153,25 +158,28 @@ def replay_hdf5_file(
         depth_dir = os.path.join(output_data_dir, "depth")
         seg_instance_id_dir = os.path.join(output_data_dir, "seg_instance_id")
         poses_dir = os.path.join(output_data_dir, "poses")
+        # flow_dir = os.path.join(output_data_dir, "flow")
         os.makedirs(rgb_dir, exist_ok=True)
         os.makedirs(depth_dir, exist_ok=True)
         os.makedirs(seg_instance_id_dir, exist_ok=True)
         os.makedirs(poses_dir, exist_ok=True)
+        # os.makedirs(flow_dir, exist_ok=True)
 
         cam_data_dirs[cam_name] = {
             "rgb": rgb_dir,
             "depth": depth_dir,
             "seg_instance_id": seg_instance_id_dir,
+            # "flow": flow_dir,
             "poses": poses_dir,
         }
 
-    modalities = ["rgb", "depth_linear", "seg_instance_id"]
+    modalities = ["rgb", "depth_linear", "seg_instance_id"] #, "flow"]
     robot_sensor_config = {
         "VisionSensor": {
             "modalities": modalities,
             "sensor_kwargs": {
-                "image_height": 336,
-                "image_width": 336,
+                "image_height": image_height,
+                "image_width": image_width,
             },
         },
     }
@@ -258,11 +266,11 @@ def main():
     parser.add_argument("--data_folder", type=str, default="/home/sunghwan/workspace/omnigibson/DATASETS/behavior", help="Path to the data folder")
     parser.add_argument("--task_id", type=int, default=21, help="Task ID to replay")
     parser.add_argument("--demo_id", type=int, default=210170, help="Demo ID to replay")
-    parser.add_argument("--sampling_rate", type=int, default=20, help="Sampling rate for data extraction")
+    parser.add_argument("--sampling_rate", type=int, default=1, help="Sampling rate for data extraction")
     parser.add_argument("--horizontal_aperture", type=float, default=20.995, help="Horizontal aperture for the camera.")
     parser.add_argument("--focal_length", type=float, default=17.0, help="Focal length for the camera.")
-    parser.add_argument("--image_height", type=int, default=336, help="Image height for the head camera.")
-    parser.add_argument("--image_width", type=int, default=336, help="Image width for the head camera.")
+    parser.add_argument("--image_height", type=int, default=512, help="Image height for the head camera.")
+    parser.add_argument("--image_width", type=int, default=512, help="Image width for the head camera.")
     
     args = parser.parse_args()
     

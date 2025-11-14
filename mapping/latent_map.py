@@ -149,7 +149,7 @@ def run_pca_visualization(server, grid, decoder, coords_list, env_name, epoch_la
 
     vertices_vis = torch.cat(coords_list, dim=0).numpy()
 
-    max_points_for_vis = 5000000
+    max_points_for_vis = 2000000
     if vertices_vis.shape[0] > max_points_for_vis:
         print(f"[VIS] Downsampling from {vertices_vis.shape[0]} to {max_points_for_vis} points for PCA visualization.")
         indices = np.random.choice(vertices_vis.shape[0], max_points_for_vis, replace=False)
@@ -673,15 +673,22 @@ def main():
             # --- Save checkpoint after each epoch ---
             if config['save_model']:
                 for env_name, grid in grids.items():
-                    sparse_grid_path = log_dir / f"grid.sparse_{env_name}_epoch_{epoch+1}.pt"
+                    env_log_dir = log_dir / env_name
+                    env_log_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    sparse_grid_path = env_log_dir / "grid_sparse.pt"
                     grid.save_sparse(sparse_grid_path)
-                    print(f"[SAVE] Saved sparse grid for {env_name} epoch {epoch+1} to {sparse_grid_path}")
-                
-                decoder_path = log_dir / f"decoder_epoch_{epoch+1}.pt"
-                torch.save(decoder.state_dict(), decoder_path)
-                print(f"[SAVE] Saved decoder for epoch {epoch+1} to {decoder_path}")
+                    print(f"[SAVE] Saved latest sparse grid for {env_name} epoch {epoch+1} to {sparse_grid_path}")
 
- 
+                    dense_grid_path = env_log_dir / "grid_dense.pt"
+                    grid.save_dense(dense_grid_path)
+                    print(f"[SAVE] Saved latest dense grid for {env_name} epoch {epoch+1} to {dense_grid_path}")
+
+                decoder_path = log_dir / "decoder.pt"
+                torch.save(decoder.state_dict(), decoder_path)
+                print(f"[SAVE] Saved latest decoder for epoch {epoch+1} to {decoder_path}")
+
+
         # ----------------------------------------------------------------------- #
         #  Final save and hash collision check                                    #
         # ----------------------------------------------------------------------- #
@@ -703,13 +710,6 @@ def main():
                     else:
                         print(f"    {level_name}: 0 voxels")
 
-                sparse_grid_path = log_dir / f"grid.sparse_{env_name}.pt"
-                grid.save_sparse(sparse_grid_path)
-                print(f"[SAVE] Saved final sparse grid for {env_name} to {sparse_grid_path}")
-
-            decoder_path = log_dir / "decoder.pt"
-            torch.save(decoder.state_dict(), decoder_path)
-            print(f"[SAVE] Saved final decoder to {decoder_path}")
     else:
         # Inference mode: Load coordinates for visualization
         agg_coords = defaultdict(list)
