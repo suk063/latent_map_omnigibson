@@ -6,199 +6,26 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import viser
-import random
 from collections import defaultdict
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import Dataset
 from tqdm import tqdm   
 from torch.utils.tensorboard import SummaryWriter
 import open_clip
 import yaml
+import json
 
 # local modules
 from mapping_lib.utils import get_3d_coordinates
 from mapping_lib.voxel_hash_table import VoxelHashTable
 from mapping_lib.implicit_decoder import ImplicitDecoder
+from mapping_lib.vision_wrapper import EvaClipWrapper, DINOv3Wrapper
+from mapping_lib.visualization import run_pca_visualization, visualize_instances_plotly
 from torchvision import transforms
 
 
 # ==============================================================================================
-#  Model Wrappers
-# ==============================================================================================
-
-# EVA_CLIP wrapper class
-class EvaClipWrapper(torch.nn.Module):
-    def __init__(self, clip_model, output_dim=768):
-        super().__init__()
-        self.clip_model = clip_model
-        self.output_dim = output_dim
-
-        # EVA_CLIP normalization
-        self.normalize = transforms.Normalize(
-            mean=(0.48145466, 0.4578275, 0.40821073),
-            std=(0.26862954, 0.26130258, 0.27577711),
-        )
-
-    @torch.no_grad()
-    def _forward_eva_clip_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Returns per-patch token embeddings without the [CLS] token.
-        Shape: (B, N, C), where N = (H/14)*(W/14), C = embed_dim.
-        """
-        vision_model = self.clip_model.visual.trunk
-        x = vision_model.forward_features(x)
-        x = vision_model.norm(x)
-        x = vision_model.fc_norm(x) # fc_norm is not in this version of open_clip
-        x = vision_model.head_drop(x)
-        x = vision_model.head(x)
-        x = x[:, 1:, :] # drop CLS token
-        dense_features = F.normalize(x, dim=-1)
-        return dense_features
-
-    def forward(self, images_bchw: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images_bchw: Float tensor in [0, 1], shape (B, 3, H, W)
-
-        Returns:
-            fmap: (B, C, Hf, Wf) where C = output_dim and Hf = H//14, Wf = W//14
-        """
-        if images_bchw.dtype != torch.float32:
-            images_bchw = images_bchw.float()
-        # Normalize per EVA_CLIP recipe
-        images_bchw = self.normalize(images_bchw)
-
-        B, _, H, W = images_bchw.shape
-        with torch.no_grad():
-            tokens = self._forward_eva_clip_tokens(images_bchw)  # (B, N, C)
-
-        C = self.output_dim
-        Hf, Wf = H // 14, W // 14
-        fmap = tokens.permute(0, 2, 1).reshape(B, C, Hf, Wf).contiguous()
-
-        return fmap
-
-
-# DINOv3 wrapper class
-class DINOv3Wrapper(torch.nn.Module):
-    def __init__(self, backbone):
-        super().__init__()
-        self.backbone = backbone
-        self.feature_dim = backbone.embed_dim
-
-        # DINOv3 normalization
-        self.normalize = transforms.Normalize(
-            mean=(0.485, 0.456, 0.406),
-            std=(0.229, 0.224, 0.225)
-        )
-    
-    @torch.no_grad()
-    def _forward_dino_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Returns per-patch token embeddings without the [CLS] token.
-        Shape: (B, N, C), where N = (H/14)*(W/14), C = embed_dim.
-        """
-        x, (H, W) = self.backbone.prepare_tokens_with_masks(x)
-
-        for blk in self.backbone.blocks:
-            if hasattr(self.backbone, "rope_embed") and self.backbone.rope_embed is not None:
-                rope_sincos = self.backbone.rope_embed(H=H, W=W)
-            else:
-                raise ValueError("Rope embedding not found in DINOv3")
-            x = blk(x, rope_sincos)
-        x = self.backbone.norm(x)  # (B, 1 + N, C)
-        x = x[:, 5:, :]  # drop CLS and storage tokens
-
-        return x
-
-    def forward(self, images_bchw: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images_bchw: Float tensor in [0, 1], shape (B, 3, H, W)
-
-        Returns:
-            fmap: (B, C, Hf, Wf) where C = feature_dim and Hf = H//16, Wf = W//16
-        """
-        if images_bchw.dtype != torch.float32:
-            images_bchw = images_bchw.float()
-        # Normalize per DINOv3 recipe
-        images_bchw = self.normalize(images_bchw)
-
-        B, _, H, W = images_bchw.shape
-        with torch.no_grad():
-            tokens = self._forward_dino_tokens(images_bchw)  # (B, N, C)
-
-        C = self.feature_dim
-        Hf, Wf = H // 16, W // 16
-        fmap = tokens.permute(0, 2, 1).reshape(B, C, Hf, Wf).contiguous()
-
-        return fmap
-
-
-# ==============================================================================================
-# PCA Visualization Function
-# ==============================================================================================
-def run_pca_visualization(server, grid, decoder, coords_list, env_name, epoch_label, device):
-    """Runs PCA on voxel features and sends them to the Viser server."""
-    if not coords_list:
-        print(f"[VIS] No coordinates to visualize for epoch {epoch_label}.")
-        return
-
-    print(f"\n[VIS] Running PCA on voxel features for {env_name} (epoch: {epoch_label})...")
-
-    vertices_vis = torch.cat(coords_list, dim=0).numpy()
-
-    max_points_for_vis = 2000000
-    if vertices_vis.shape[0] > max_points_for_vis:
-        print(f"[VIS] Downsampling from {vertices_vis.shape[0]} to {max_points_for_vis} points for PCA visualization.")
-        indices = np.random.choice(vertices_vis.shape[0], max_points_for_vis, replace=False)
-        vertices_vis = vertices_vis[indices]
-
-    if vertices_vis.shape[0] == 0:
-        print("[VIS] No vertices to visualize; skipping PCA visualization.")
-        return
-
-    coords_t = torch.from_numpy(vertices_vis).to(device)
-    batch_size = 50000
-    all_feats = []
-    with torch.no_grad():
-        for i in tqdm(range(0, coords_t.shape[0], batch_size), desc="[VIS] Processing features"):
-            batch_coords = coords_t[i:i+batch_size]
-            voxel_feat = grid.query_voxel_feature(batch_coords)
-            feats_t = decoder(voxel_feat)
-            all_feats.append(feats_t.cpu())
-
-    feats_np = torch.cat(all_feats, dim=0).numpy()
-    pca = PCA(n_components=3)
-    feats_pca = pca.fit_transform(feats_np)
-    scaler = MinMaxScaler()
-    feats_pca_norm = scaler.fit_transform(feats_pca)
-
-    z_threshold = 2.5
-    vis_mask = vertices_vis[:, 2] <= z_threshold
-    filtered_vertices = vertices_vis[vis_mask]
-    filtered_colors = feats_pca_norm[vis_mask]
-    
-     # Center the point cloud (x, y) for visualization
-    x_center = (config['scene_min'][0] + config['scene_max'][0]) / 2.0
-    y_center = (config['scene_min'][1] + config['scene_max'][1]) / 2.0
-    
-    centered_vertices = filtered_vertices.copy()
-    centered_vertices[:, 0] -= x_center
-    centered_vertices[:, 1] -= y_center
-
-    print(f"[VIS] Updating PCA visualization for {env_name} (epoch: {epoch_label}) to Viser.")
-    server.add_point_cloud(
-        name=f"/pca/{env_name}",
-        points=centered_vertices,
-        colors=(filtered_colors * 255).astype(np.uint8),
-        point_size=0.01
-    )
-
-# --------------------------------------------------------------------------- #
 #  Dataset Class                                                              #
-# --------------------------------------------------------------------------- #
+# ==============================================================================================
 class MultiEnvDataset(Dataset):
     def __init__(self, dataset_dir, target_envs, num_images, transform_func, image_size, patch_size):
         self.transform_func = transform_func
@@ -225,9 +52,10 @@ class MultiEnvDataset(Dataset):
             poses_dir = env_dir / "poses"
             rgb_dir = env_dir / "rgb"
             depth_dir = env_dir / "depth"
+            inst_id_dir = env_dir / "seg_instance_id"
 
-            if not all([d.exists() for d in [poses_dir, rgb_dir, depth_dir]]):
-                print(f"  [WARN] Missing poses, rgb, or depth directory in {env_dir}. Skipping.")
+            if not all([d.exists() for d in [poses_dir, rgb_dir, depth_dir, inst_id_dir]]):
+                print(f"  [WARN] Missing poses, rgb, depth, or seg_instance_id directory in {env_dir}. Skipping.")
                 continue
             
             self.env_names.append(env_name)
@@ -252,9 +80,10 @@ class MultiEnvDataset(Dataset):
             env_samples = []
             for i, rgb_path in enumerate(tqdm(rgb_files, desc=f"  Validating {env_name}")):
                 depth_path = depth_dir / f"{rgb_path.stem}.npy"
-                if not depth_path.exists():
+                inst_id_path = inst_id_dir / f"{rgb_path.stem}.npy"
+                if not depth_path.exists() or not inst_id_path.exists():
                     continue
-                env_samples.append({"rgb_path": rgb_path, "depth_path": depth_path, "pose_idx": i, "env_name": env_name})
+                env_samples.append({"rgb_path": rgb_path, "depth_path": depth_path, "inst_id_path": inst_id_path, "pose_idx": i, "env_name": env_name})
             
             self.samples.extend(env_samples)
         
@@ -267,6 +96,7 @@ class MultiEnvDataset(Dataset):
         sample_info = self.samples[idx]
         rgb_path = sample_info["rgb_path"]
         depth_path = sample_info["depth_path"]
+        inst_id_path = sample_info["inst_id_path"]
         pose_idx = sample_info["pose_idx"]
         env_name = sample_info["env_name"]
 
@@ -276,6 +106,7 @@ class MultiEnvDataset(Dataset):
             rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_BGR2RGB)
             
             depth_np = np.load(str(depth_path))
+            inst_id_np = np.load(str(inst_id_path))
             if np.max(depth_np) == 0:
                 return None # This will be filtered by the collate function
 
@@ -290,12 +121,17 @@ class MultiEnvDataset(Dataset):
         depth_t_resized = F.interpolate(depth_t, (self.image_size, self.image_size), mode="nearest-exact")
         depth_t = F.interpolate(depth_t_resized, (self.feat_h, self.feat_h), mode="nearest-exact").squeeze()
 
+        inst_id_t = torch.from_numpy(inst_id_np).unsqueeze(0).unsqueeze(0).long()
+        inst_id_t_resized = F.interpolate(inst_id_t.float(), (self.image_size, self.image_size), mode="nearest-exact").long()
+        inst_id_t = F.interpolate(inst_id_t_resized.float(), (self.feat_h, self.feat_h), mode="nearest-exact").long().squeeze()
+
         E_cv = self.cam_to_world_poses[env_name][pose_idx][:3, :]
         extrinsic_t = torch.from_numpy(E_cv).float()
 
         return {
             "img_tensor": img_tensor,
             "depth_t": depth_t,
+            "inst_id_t": inst_id_t,
             "extrinsic_t": extrinsic_t,
             "env_name": env_name,
         }
@@ -398,15 +234,8 @@ def main():
 
     dataset_path = Path(config['dataset_dir'])
     output_path = Path(config['output_dir'])
-    if config['save_model'] or config['run_pca']:
-        output_path.mkdir(parents=True, exist_ok=True)
-
-    if config['load_run_dir']:
-        load_path = Path(config['load_run_dir'])
-        print(f"[LOAD] Attempting to load model from specified run directory: {load_path}")
-        assert load_path.is_dir(), f"Specified load directory does not exist: {load_path}"
-    else:
-        load_path = output_path
+    output_path.mkdir(parents=True, exist_ok=True)
+    load_path = output_path
 
     # Determine target environments
     target_envs = config.get('target_envs', [])
@@ -442,9 +271,8 @@ def main():
     
     task_name = dataset_path.name
     log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
-    if config['train'] or config['run_pca']:
-        tb_writer = SummaryWriter(log_dir=log_dir)
-        print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
+    tb_writer = SummaryWriter(log_dir=log_dir)
+    print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
 
     # --------------------------------------------------------------------------- #
     #  Shared Decoder                                                             #
@@ -462,334 +290,193 @@ def main():
         output_dim=feature_dim,
     ).to(DEVICE)
 
-    # ----------------------------------------------------------------------- #
-    #  Load pre-trained decoder weights if available                          #
-    # ----------------------------------------------------------------------- #
-    if config['decoder_path'] and os.path.isfile(config['decoder_path']):
-        try:
-            state_dict = torch.load(config['decoder_path'], map_location=DEVICE)['model']
-            decoder.load_state_dict(state_dict)
-            print(f"[INIT] Loaded pre-trained decoder weights from {config['decoder_path']}")
-        except Exception as e:
-            print(f"[INIT] Failed to load pre-trained decoder weights from {config['decoder_path']}: {e}")
-    else:
-        print(f"[INIT] No pre-trained decoder weights found at {config['decoder_path']}. Using random initialization.")
-
     OPT_LR = config['training']['optimizer_lr']
     
-    # 1. Create or load VoxelHashTables for each environment
+    # 1. Create VoxelHashTables for each environment
     grids = {}
-    
-    if config['train']:
-        decoder_path = load_path / "decoder.pt"
-
-        if config['continue_training'] and decoder_path.exists():
-            print(f"\n[LOAD] Found existing decoder. Loading for continued training...")
-            
-            # Load decoder
-            state_dict = torch.load(decoder_path, map_location=DEVICE)
-            if isinstance(state_dict, dict) and 'model' in state_dict:
-                decoder.load_state_dict(state_dict['model'])
-            else:
-                decoder.load_state_dict(state_dict)
-            print(f"[LOAD] Loaded decoder from {decoder_path}")
-
-        for env_name in env_names:
-            grid_path = load_path / f"grid_{env_name}.pt"
-            if config['continue_training'] and grid_path.exists():
-                print(f"[LOAD] Loading grid for {env_name} from {grid_path}")
-                sparse_data = torch.load(grid_path, map_location=DEVICE)
-                grid = VoxelHashTable(
-                    resolution=RESOLUTION, num_levels=GRID_LVLS, level_scale=LEVEL_SCALE,
-                    feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE,
-                    scene_bound_min=SCENE_MIN, scene_bound_max=SCENE_MAX,
-                    device=DEVICE, mode="train", sparse_data=sparse_data,
-                )
-            else:
-                print(f"\n[INIT] Creating a new grid for {env_name}.")
-                grid = VoxelHashTable(
-                    resolution=RESOLUTION, num_levels=GRID_LVLS, level_scale=LEVEL_SCALE,
-                    feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE,
-                    scene_bound_min=SCENE_MIN, scene_bound_max=SCENE_MAX,
-                    device=DEVICE, mode="train",
-                )
-                stats = grid.collision_stats()
-                print(f"--- Collision stats for {env_name}: ---")
-                for level_name, stat in stats.items():
-                    total = stat['total']
-                    collisions = stat['col']
-                    if total > 0:
-                        percentage = (collisions / total) * 100
-                        print(f"  {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
-                    else:
-                        print(f"  {level_name}: 0 voxels")
-                print("-------------------------------------------------")
-            grids[env_name] = grid
-    else:
-        # Inference mode: Load pre-trained grids and decoder
-        print("\n[LOAD] Loading pre-trained grids and decoder for visualization...")
-        
-        # Load decoder weights
-        decoder_path = load_path / "decoder.pt"
-        if not decoder_path.exists():
-            print(f"[ERROR] Pre-trained decoder not found at {decoder_path}. Cannot proceed.")
-            return
-        
-        state_dict = torch.load(decoder_path, map_location=DEVICE)
-        if isinstance(state_dict, dict) and 'model' in state_dict:
-            decoder.load_state_dict(state_dict['model'])
-        else:
-            decoder.load_state_dict(state_dict)
-        print(f"[LOAD] Loaded decoder from {decoder_path}")
-
-        for env_name in env_names:
-            sparse_grid_path = load_path / f"grid.sparse_{env_name}.pt"
-            if not sparse_grid_path.exists():
-                print(f"[LOAD] [WARN] Pre-trained grid not found for env '{env_name}' at {sparse_grid_path}. Skipping.")
-                continue
-            
-            sparse_data = torch.load(sparse_grid_path, map_location=DEVICE)
-            grid = VoxelHashTable(
-                mode="infer", sparse_data=sparse_data, device=DEVICE,
-                feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE
-            )
-            grids[env_name] = grid
-            print(f"[LOAD] Loaded grid for {env_name} from {sparse_grid_path}")
-        
-        if not grids:
-            print("[ERROR] No valid grids were loaded. Exiting.")
-            return
-
-
-    if config['train']:
-        # 2. Setup a single optimizer for all grids and the shared decoder
-        all_params = list(decoder.parameters())
-        for grid in grids.values():
-            all_params.extend(list(grid.parameters()))
-        optimizer = torch.optim.Adam(all_params, lr=OPT_LR)
-
-        # 3. Load all data from the environments
-        try:
-            dataset = MultiEnvDataset(dataset_path, target_envs, config['num_images'], transform, image_size, patch_size)
-            if len(dataset) == 0:
-                print("[ERROR] No valid training data found after filtering. Exiting.")
-                return
-        except FileNotFoundError as e:
-            print(f"[ERROR] {e}")
-            return
-        
-        dataloader = DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-            collate_fn=collate_fn
+    for env_name in env_names:
+        print(f"\n[INIT] Creating a new grid for {env_name}.")
+        grid = VoxelHashTable(
+            resolution=RESOLUTION, num_levels=GRID_LVLS, level_scale=LEVEL_SCALE,
+            feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE,
+            scene_bound_min=SCENE_MIN, scene_bound_max=SCENE_MAX,
+            device=DEVICE,
         )
-        print(f"--- Loaded {len(dataset)} samples. Starting training... ---")
-
-        # 4. Main training loop
-        LOG_INTERVAL = config['training']['log_interval']
-        for epoch in range(config['training']['epochs']):
-            loss_history = []
-            epoch_coords = defaultdict(list)
-            
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}")
-            for i, data in enumerate(pbar):
-                if not data: continue # Skip empty batches from collate_fn
-
-                # --- Get preprocessed data from dataset ---
-                img_tensor = data["img_tensor"].to(DEVICE)
-                depth_t = data["depth_t"].to(DEVICE)
-                extrinsic_t = data["extrinsic_t"].unsqueeze(1).to(DEVICE)
-                env_name = data["env_name"][0] # Batch size is 1
-
-                with torch.no_grad():
-                    vis_feat = model(img_tensor)
-                
-                coords_world, _ = get_3d_coordinates(
-                    depth_t, extrinsic_t,
-                    fx=fx, fy=fy, cx=cx, cy=cy,
-                    original_size=image_size,
-                )
-
-                B, C_, Hf, Wf = vis_feat.shape
-                feats_valid = vis_feat.permute(0, 2, 3, 1).reshape(-1, C_)
-                coords_valid = coords_world.permute(0, 2, 3, 1).reshape(-1, 3)
-            
-
-                in_x = (coords_valid[:,0] > SCENE_MIN[0]) & (coords_valid[:,0] < SCENE_MAX[0])
-                in_y = (coords_valid[:,1] > SCENE_MIN[1]) & (coords_valid[:,1] < SCENE_MAX[1])
-                in_z = (coords_valid[:,2] > SCENE_MIN[2]) & (coords_valid[:,2] < SCENE_MAX[2])
-                in_bounds = in_x & in_y & in_z
-                
-                # Filter out points with depth < 0.01
-                depth_flat = depth_t.reshape(-1)
-                valid_depth = depth_flat >= 0.01
-                in_bounds = in_bounds & valid_depth
-
-                if in_bounds.sum() == 0:
-                    continue
-
-                coords_valid = coords_valid[in_bounds].to(DEVICE)
-
-                # accumulate for visualization (store on CPU to save GPU mem)
-                if config['run_pca'] and env_name == env_names[0]: # Only for the first env
-                    epoch_coords[env_name].append(coords_valid.cpu())
-                feats_valid = feats_valid[in_bounds].to(DEVICE)
-            
-                
-                grid = grids[env_name] # Get the correct grid for this environment
-                voxel_feat = grid.query_voxel_feature(coords_valid)
-                pred_feat = decoder(voxel_feat)
-
-                cos_sim = F.cosine_similarity(pred_feat, feats_valid, dim=-1)
-                loss = 1.0 - cos_sim.mean()
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                loss_history.append(loss.item())
-
-
-                global_step = epoch * len(dataloader) + i
-                tb_writer.add_scalar("Loss/step", loss.item(), global_step)
-
-                if (i + 1) % LOG_INTERVAL == 0:
-                    pbar.set_postfix_str(f"Loss: {loss.item():.4f}")
-            
-            avg_loss = sum(loss_history) / len(loss_history) if loss_history else 0
-            print(f"[Epoch {epoch+1}/{config['training']['epochs']}] Avg. Loss: {avg_loss:.4f}")
-
-
-            tb_writer.add_scalar("Loss/epoch", avg_loss, epoch + 1)
-
-            # --- Periodic PCA Visualization ---
-            if config['run_pca'] and config['vis_interval'] > 0 and (epoch + 1) % config['vis_interval'] == 0:
-                first_env_name = env_names[0]
-                run_pca_visualization(server, grids[first_env_name], decoder, epoch_coords[first_env_name], first_env_name, epoch + 1, DEVICE)
-
-            # --- Save checkpoint after each epoch ---
-            if config['save_model']:
-                for env_name, grid in grids.items():
-                    env_log_dir = log_dir / env_name
-                    env_log_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    sparse_grid_path = env_log_dir / "grid_sparse.pt"
-                    grid.save_sparse(sparse_grid_path)
-                    print(f"[SAVE] Saved latest sparse grid for {env_name} epoch {epoch+1} to {sparse_grid_path}")
-
-                    dense_grid_path = env_log_dir / "grid_dense.pt"
-                    grid.save_dense(dense_grid_path)
-                    print(f"[SAVE] Saved latest dense grid for {env_name} epoch {epoch+1} to {dense_grid_path}")
-
-                decoder_path = log_dir / "decoder.pt"
-                torch.save(decoder.state_dict(), decoder_path)
-                print(f"[SAVE] Saved latest decoder for epoch {epoch+1} to {decoder_path}")
-
-
-        # ----------------------------------------------------------------------- #
-        #  Final save and hash collision check                                    #
-        # ----------------------------------------------------------------------- #
-        if config['save_model']:
-            for env_name, grid in grids.items():
-                print(f"\n[CHECK] Evaluating hash collisions for {env_name} in infer mode...")
-                sparse_data = grid.export_sparse()
-                infer_grid = VoxelHashTable(
-                    mode="infer", sparse_data=sparse_data, device=DEVICE,
-                    feature_dim=GRID_FEAT_DIM, hash_table_size=HASH_TABLE_SIZE
-                )
-                stats = infer_grid.collision_stats()
-                print(f"  [Infer] {env_name}:")
-                for level_name, stat in stats.items():
-                    total, collisions = stat['total'], stat['col']
-                    if total > 0:
-                        percentage = (collisions / total) * 100
-                        print(f"    {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
-                    else:
-                        print(f"    {level_name}: 0 voxels")
-
-    else:
-        # Inference mode: Load coordinates for visualization
-        agg_coords = defaultdict(list)
-        for env_name in env_names:
-            print(f"\n[VIS] Loading data for {env_name} visualization...")
-            env_path = dataset_path / env_name
-            rgb_files = sorted(list((env_path / "rgb").glob("*.png")))
-            depth_files = sorted(list((env_path / "depth").glob("*.npy")))
-            
-            if config['num_images'] > 0:
-                rgb_files = rgb_files[:config['num_images']]
-                depth_files = depth_files[:config['num_images']]
-            
-            if not rgb_files or not depth_files:
-                print(f"[VIS] [WARN] No data found in {env_name}, skipping.")
-                continue
-            
-            poses_dir = env_path / "poses"
-            pose_files = sorted(list(poses_dir.glob("*.npy")))
-            poses_4x4 = [np.load(f) for f in pose_files]
-            cam_to_world_poses = np.array([np.linalg.inv(p_4x4) for p_4x4 in poses_4x4])
-
-            feat_h = image_size // patch_size
-            for i, (rgb_path, depth_path) in enumerate(tqdm(zip(rgb_files, depth_files), desc=f"Loading {env_name}", total=len(rgb_files))):
-                depth_np = np.load(str(depth_path))
-                if depth_np is None or np.max(depth_np) == 0:
-                    continue
-                
-                depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0).float()
-                depth_t_resized = F.interpolate(depth_t, (image_size, image_size), mode="nearest-exact")
-                depth_t = F.interpolate(depth_t_resized, (feat_h, feat_h), mode="nearest-exact").squeeze()
-                
-                E_cv = cam_to_world_poses[i][:3, :]
-                extrinsic_t = torch.from_numpy(E_cv).float().unsqueeze(0).to(DEVICE)
-                
-                coords_world, _ = get_3d_coordinates(
-                    depth_t.unsqueeze(0), extrinsic_t.unsqueeze(1),
-                    fx=fx, fy=fy, cx=cx, cy=cy,
-                    original_size=image_size,
-                )
-                
-                coords_valid = coords_world.permute(0, 2, 3, 1).reshape(-1, 3)
-                
-                in_x = (coords_valid[:,0] > SCENE_MIN[0]) & (coords_valid[:,0] < SCENE_MAX[0])
-                in_y = (coords_valid[:,1] > SCENE_MIN[1]) & (coords_valid[:,1] < SCENE_MAX[1])
-                in_z = (coords_valid[:,2] > SCENE_MIN[2]) & (coords_valid[:,2] < SCENE_MAX[2])
-                in_bounds = in_x & in_y & in_z
-                
-                depth_flat = depth_t.reshape(-1)
-                valid_depth = depth_flat >= 0.01
-                in_bounds = in_bounds & valid_depth
-                
-                if in_bounds.sum() == 0:
-                    continue
-                
-                coords_valid = coords_valid[in_bounds]
-                agg_coords[env_name].append(coords_valid.cpu())
-        
-        print(f"[VIS] Loaded coordinates for visualization.")
-    
-    # --- PCA Visualization ---
-    if config['run_pca']:
-        first_env_name = env_names[0]
-        if first_env_name not in grids:
-            print(f"[VIS] [ERROR] Grid for the first environment '{first_env_name}' was not loaded. Skipping PCA.")
-        else:
-            if config['train']:
-                if config['vis_interval'] == 0:
-                     print("\n[VIS] PCA visualization was not run during training. Set 'vis_interval' > 0 to enable.")
-                else:
-                    print(f"\n[VIS] Running final PCA for {first_env_name}.")
-                    # To run final PCA, we need to collect all coords, which we only did for the first env.
-                    # The current logic handles periodic viz, which is sufficient.
-                    pass
+        stats = grid.collision_stats()
+        print(f"--- Collision stats for {env_name}: ---")
+        for level_name, stat in stats.items():
+            total = stat['total']
+            collisions = stat['col']
+            if total > 0:
+                percentage = (collisions / total) * 100
+                print(f"  {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
             else:
-                # In inference mode, run PCA on the first environment's aggregated coordinates.
-                run_pca_visualization(server, grids[first_env_name], decoder, agg_coords[first_env_name], first_env_name, "final", DEVICE)
+                print(f"  {level_name}: 0 voxels")
+        print("-------------------------------------------------")
+        grids[env_name] = grid
 
-    if config['train'] or config['run_pca']:
-        tb_writer.close()
+    # 2. Setup a single optimizer for all grids and the shared decoder
+    all_params = list(decoder.parameters())
+    for grid in grids.values():
+        all_params.extend(list(grid.parameters()))
+    optimizer = torch.optim.Adam(all_params, lr=OPT_LR)
+
+    # 3. Load all data from the environments
+    try:
+        dataset = MultiEnvDataset(dataset_path, target_envs, config['num_images'], transform, image_size, patch_size)
+        if len(dataset) == 0:
+            print("[ERROR] No valid training data found after filtering. Exiting.")
+            return
+    except FileNotFoundError as e:
+        print(f"[ERROR] {e}")
+        return
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    print(f"--- Loaded {len(dataset)} samples. Starting training... ---")
+
+    # --- Setup target instance IDs for storing ---
+    target_instance_ids = list(range(28, 35))  # IDs 28 to 34
+    print(f"[INFO] Target instance IDs to store: {target_instance_ids}")
+    target_instance_ids_tensor = torch.tensor(target_instance_ids, device=DEVICE, dtype=torch.long)
+
+
+    # ==============================================================================================
+    #  Training Loop                                                              #
+    # ==============================================================================================
+    LOG_INTERVAL = config['training']['log_interval']
+    for epoch in range(config['training']['epochs']):
+        loss_history = []
+        epoch_coords = defaultdict(list)
+        
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}")
+        for i, data in enumerate(pbar):
+            if not data: continue # Skip empty batches from collate_fn
+
+            # --- Get preprocessed data from dataset ---
+            img_tensor = data["img_tensor"].to(DEVICE)
+            depth_t = data["depth_t"].to(DEVICE)
+            extrinsic_t = data["extrinsic_t"].to(DEVICE)
+            inst_id_t = data["inst_id_t"].to(DEVICE)
+            env_name = data["env_name"][0] # Batch size is 1
+
+            with torch.no_grad():
+                vis_feat = model(img_tensor)
+            
+            coords_world, _ = get_3d_coordinates(
+                depth_t, extrinsic_t,
+                fx=fx, fy=fy, cx=cx, cy=cy,
+                original_size=image_size,
+            )
+
+            B, C_, Hf, Wf = vis_feat.shape
+            feats_valid = vis_feat.permute(0, 2, 3, 1).reshape(-1, C_)
+            coords_valid = coords_world.permute(0, 2, 3, 1).reshape(-1, 3)
+        
+
+            in_x = (coords_valid[:,0] > SCENE_MIN[0]) & (coords_valid[:,0] < SCENE_MAX[0])
+            in_y = (coords_valid[:,1] > SCENE_MIN[1]) & (coords_valid[:,1] < SCENE_MAX[1])
+            in_z = (coords_valid[:,2] > SCENE_MIN[2]) & (coords_valid[:,2] < SCENE_MAX[2])
+            in_bounds = in_x & in_y & in_z
+            
+            # Filter out points with depth < 0.01
+            depth_flat = depth_t.reshape(-1)
+            valid_depth = depth_flat >= 0.01
+            in_bounds = in_bounds & valid_depth
+
+            if in_bounds.sum() == 0:
+                continue
+
+            coords_valid = coords_valid[in_bounds].to(DEVICE)
+            inst_id_flat = inst_id_t.reshape(-1)
+            inst_id_valid = inst_id_flat[in_bounds]
+
+            # accumulate for visualization (store on CPU to save GPU mem)
+            if config['run_pca'] and env_name == env_names[0]: # Only for the first env
+                epoch_coords[env_name].append(coords_valid.cpu())
+            feats_valid = feats_valid[in_bounds].to(DEVICE)
+        
+            
+            grid = grids[env_name] # Get the correct grid for this environment
+
+            # --- Update instance IDs in the grid for target objects ---
+            if target_instance_ids_tensor.numel() > 0:
+                is_target_instance = torch.isin(inst_id_valid, target_instance_ids_tensor)
+                coords_to_store = coords_valid[is_target_instance]
+                inst_ids_to_store = inst_id_valid[is_target_instance]
+
+                if coords_to_store.shape[0] > 0:
+                    unique_ids, counts = torch.unique(inst_ids_to_store, return_counts=True)
+                    # print(f"[INFO] Found {coords_to_store.shape[0]} points for target instances. IDs: {unique_ids.cpu().numpy()}, Counts: {counts.cpu().numpy()}")
+                    grid.update_instance_ids(coords_to_store, inst_ids_to_store)
+
+            voxel_feat = grid.query_voxel_feature(coords_valid)
+            pred_feat = decoder(voxel_feat)
+
+            cos_sim = F.cosine_similarity(pred_feat, feats_valid, dim=-1)
+            loss = 1.0 - cos_sim.mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_history.append(loss.item())
+
+
+            global_step = epoch * len(dataloader) + i
+            tb_writer.add_scalar("Loss/step", loss.item(), global_step)
+
+            if (i + 1) % LOG_INTERVAL == 0:
+                pbar.set_postfix_str(f"Loss: {loss.item():.4f}")
+        
+        avg_loss = sum(loss_history) / len(loss_history) if loss_history else 0
+        print(f"[Epoch {epoch+1}/{config['training']['epochs']}] Avg. Loss: {avg_loss:.4f}")
+
+
+        tb_writer.add_scalar("Loss/epoch", avg_loss, epoch + 1)
+
+        # --- Periodic PCA Visualization ---
+        if config['run_pca'] and config['vis_interval'] > 0 and (epoch + 1) % config['vis_interval'] == 0:
+            first_env_name = env_names[0]
+            run_pca_visualization(server, grids[first_env_name], decoder, epoch_coords[first_env_name], first_env_name, epoch + 1, DEVICE, config)
+            visualize_instances_plotly(grids[first_env_name], epoch_coords[first_env_name], first_env_name, epoch + 1, DEVICE, config, target_instance_ids)
+
+        # --- Save checkpoint after each epoch ---
+        for env_name, grid in grids.items():
+            env_log_dir = log_dir / env_name
+            env_log_dir.mkdir(parents=True, exist_ok=True)
+            
+            grid_path = env_log_dir / "grid.pt"
+            torch.save(grid.state_dict(), grid_path)
+            print(f"[SAVE] Saved latest grid for {env_name} epoch {epoch+1} to {grid_path}")
+
+        decoder_path = log_dir / "decoder.pt"
+        torch.save(decoder.state_dict(), decoder_path)
+        print(f"[SAVE] Saved latest decoder for epoch {epoch+1} to {decoder_path}")
+
+
+    # ----------------------------------------------------------------------- #
+    #  Final save and hash collision check                                    #
+    # ----------------------------------------------------------------------- #
+    for env_name, grid in grids.items():
+        print(f"\n[CHECK] Evaluating hash collisions for {env_name}...")
+        stats = grid.collision_stats()
+        print(f"  [Stats] {env_name}:")
+        for level_name, stat in stats.items():
+            total, collisions = stat['total'], stat['col']
+            if total > 0:
+                percentage = (collisions / total) * 100
+                print(f"    {level_name}: {collisions} collisions out of {total} voxels ({percentage:.2f}%)")
+            else:
+                print(f"    {level_name}: 0 voxels")
+
+    tb_writer.close()
 
     if config['run_pca']:
         print("\n[VIS] Viser server is running. Open the link in your browser.")

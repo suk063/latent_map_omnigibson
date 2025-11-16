@@ -1,7 +1,4 @@
 # Run settings
-train: True
-continue_training: False
-save_model: True
 run_pca: True
 vis_interval: 1
 num_images: -1 # -1 for all
@@ -9,8 +6,6 @@ num_images: -1 # -1 for all
 # Paths
 dataset_dir: "mapping/dataset/task-0021"
 output_dir: "mapping/map_output/task-0021"
-decoder_path: 
-load_run_dir:
 # load_run_dir: "mapping/map_output/sorting_household_items/runs/sorting_household_items_20251103-235158"
 
 # Optional: Specify which environments to use. If empty or commented out, all will be used.
@@ -43,18 +38,18 @@ dino_model:
   patch_size: 16
 
 grid:
-  levels: 2
-  feature_dim: 64
+  levels: 1
+  feature_dim: 128
   level_scale: 2.0
-  hash_table_size: 2097152 # 2**21
-  resolution: 0.1
+  hash_table_size: 2097152  # 2**21
+  resolution: 0.125
 
 decoder:
   hidden_dim: 256
 
 # Training settings
 training:
-  epochs: 10
+  epochs: 20
   optimizer_lr: 0.001
   log_interval: 100
 

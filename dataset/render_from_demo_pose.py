@@ -17,6 +17,7 @@ from tqdm import tqdm
 import copy
 import argparse
 import time
+import json
 from omnigibson.macros import gm
 
 
@@ -69,11 +70,15 @@ def load_pose_files(data_folder, task_id, demo_id):
             print(f"Loaded {len(files)} poses from {cam_key}")
     return pose_files
 
-def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, pos, orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir):
+def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, pos, orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir, seg_semantic_image=None, seg_semantic_dir=None, seg_instance_image=None, seg_instance_dir=None):
     frame_filename_base = f"{frame_idx:05d}"
     imageio.imwrite(os.path.join(rgb_dir, f"{frame_filename_base}.png"), rgb_image)
     np.save(os.path.join(depth_dir, f"{frame_filename_base}.npy"), depth_image)
     np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image)
+    if seg_semantic_image is not None and seg_semantic_dir is not None:
+        np.save(os.path.join(seg_semantic_dir, f"{frame_filename_base}.npy"), seg_semantic_image)
+    if seg_instance_image is not None and seg_instance_dir is not None:
+        np.save(os.path.join(seg_instance_dir, f"{frame_filename_base}.npy"), seg_instance_image)
     
     # Construct and save the extrinsic matrix in OpenCV format (world-to-camera)
     R_world_og = Rotation.from_quat(orn.cpu().numpy()).as_matrix()
@@ -189,10 +194,14 @@ def build_scene_from_hdf5(
     rgb_dir = os.path.join(data_dir, "rgb")
     depth_dir = os.path.join(data_dir, "depth")
     seg_instance_id_dir = os.path.join(data_dir, "seg_instance_id")
+    seg_instance_dir = os.path.join(data_dir, "seg_instance")
+    seg_semantic_dir = os.path.join(data_dir, "seg_semantic")
     poses_dir = os.path.join(data_dir, "poses")
     os.makedirs(rgb_dir, exist_ok=True)
     os.makedirs(depth_dir, exist_ok=True)
     os.makedirs(seg_instance_id_dir, exist_ok=True)
+    os.makedirs(seg_instance_dir, exist_ok=True)
+    os.makedirs(seg_semantic_dir, exist_ok=True)
     os.makedirs(poses_dir, exist_ok=True)
 
     pose_files = load_pose_files(data_folder, task_id, demo_id)
@@ -212,7 +221,7 @@ def build_scene_from_hdf5(
     }
 
     
-    modalities = ["rgb", "depth_linear", "seg_instance_id"]
+    modalities = ["rgb", "depth_linear", "seg_instance_id", "seg_semantic", "seg_instance"]
     external_sensors_config = [{
         "name": "my_sensor",
         "sensor_type": "VisionSensor",
@@ -306,6 +315,8 @@ def build_scene_from_hdf5(
     # Correctly calculate the number of items for tqdm
     num_to_render = (num_poses - start_frame_idx + sampling_rate - 1) // sampling_rate
 
+    cumulative_instance_id_map = {}
+
     with tqdm(total=num_to_render, desc="Generating samples") as pbar:
         for frame_idx in range(start_frame_idx, num_poses, sampling_rate):
             pose_file = sorted_pose_files[frame_idx]
@@ -325,13 +336,27 @@ def build_scene_from_hdf5(
 
             cur_pos, cur_orn = sensor.get_position_orientation()
 
-            obs, _ = sensor.get_obs()
+            obs, info = sensor.get_obs()
+
+            # Merge the instance ID map from the current frame
+            if "seg_instance_id" in info:
+                # The keys are strings of integers. Let's convert them to ints.
+                current_map = {int(k): v for k, v in info["seg_instance_id"].items()}
+                cumulative_instance_id_map.update(current_map)
+
+                # For debugging: save the cumulative map in every iteration
+                mapping_path = os.path.join(data_dir, "instance_id_to_name.json")
+                with open(mapping_path, 'w') as f:
+                    json.dump(cumulative_instance_id_map, f, indent=4)
+
             rgb_image = copy.deepcopy(obs["rgb"][..., :3].cpu().numpy())
             depth_image = copy.deepcopy(obs["depth_linear"].cpu().numpy().squeeze())
             seg_instance_id_image = copy.deepcopy(obs["seg_instance_id"].cpu().numpy().squeeze())
+            seg_instance_image = copy.deepcopy(obs["seg_instance"].cpu().numpy().squeeze())
+            seg_semantic_image = copy.deepcopy(obs["seg_semantic"].cpu().numpy().squeeze())
 
             # Save the sample
-            save_data(save_idx, rgb_image, depth_image, seg_instance_id_image, cur_pos, cur_orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir)
+            save_data(save_idx, rgb_image, depth_image, seg_instance_id_image, cur_pos, cur_orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir, seg_semantic_image=seg_semantic_image, seg_semantic_dir=seg_semantic_dir, seg_instance_image=seg_instance_image, seg_instance_dir=seg_instance_dir)
             save_idx += 1
             pbar.update(1)
             time.sleep(0.01)

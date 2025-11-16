@@ -20,67 +20,12 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from mapping.mapping_lib.implicit_decoder import ImplicitDecoder
 from mapping.mapping_lib.voxel_hash_table import VoxelHashTable
+from mapping.mapping_lib.vision_wrapper import DINOv3Wrapper
 
 
 # ==============================================================================================
 #  Model Wrappers & Helpers (from mapping/latent_map.py)
 # ==============================================================================================
-
-# DINOv3 wrapper class
-class DINOv3Wrapper(torch.nn.Module):
-    def __init__(self, backbone):
-        super().__init__()
-        self.backbone = backbone
-        self.feature_dim = backbone.embed_dim
-
-        # DINOv3 normalization
-        self.normalize = transforms.Normalize(
-            mean=(0.485, 0.456, 0.406),
-            std=(0.229, 0.224, 0.225)
-        )
-    
-    @torch.no_grad()
-    def _forward_dino_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Returns per-patch token embeddings without the [CLS] token.
-        Shape: (B, N, C), where N = (H/14)*(W/14), C = embed_dim.
-        """
-        x, (H, W) = self.backbone.prepare_tokens_with_masks(x)
-
-        for blk in self.backbone.blocks:
-            if hasattr(self.backbone, "rope_embed") and self.backbone.rope_embed is not None:
-                rope_sincos = self.backbone.rope_embed(H=H, W=W)
-            else:
-                raise ValueError("Rope embedding not found in DINOv3")
-            x = blk(x, rope_sincos)
-        x = self.backbone.norm(x)  # (B, 1 + N, C)
-        x = x[:, 5:, :]  # drop CLS and storage tokens
-
-        return x
-
-    def forward(self, images_bchw: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            images_bchw: Float tensor in [0, 1], shape (B, 3, H, W)
-
-        Returns:
-            fmap: (B, C, Hf, Wf) where C = feature_dim and Hf = H//16, Wf = W//16
-        """
-        if images_bchw.dtype != torch.float32:
-            images_bchw = images_bchw.float()
-        # Normalize per DINOv3 recipe
-        images_bchw = self.normalize(images_bchw)
-
-        B, _, H, W = images_bchw.shape
-        with torch.no_grad():
-            tokens = self._forward_dino_tokens(images_bchw)  # (B, N, C)
-
-        C = self.feature_dim
-        patch_size = 16 # Varies by DINO model, vith16plus is 16
-        Hf, Wf = H // patch_size, W // patch_size
-        fmap = tokens.permute(0, 2, 1).reshape(B, C, Hf, Wf).contiguous()
-
-        return fmap
 
 def get_3d_coordinates_from_depth(depth, E_cv, fx, fy, cx, cy, device='cpu'):
     """
@@ -137,12 +82,12 @@ def main():
 
     # Define paths based on config and latest run
     # NOTE: This assumes the latest run is the one to be used.
-    run_dir = "mapping/map_output/task-0021/runs/task-0021_20251113-193630"
+    run_dir = "mapping/map_output/task-0021/runs/task-0021_20251114-192217"
     decoder_path = os.path.join(run_dir, "decoder.pt")
     
     # Try to determine env_name from the data_dir arg
     env_name = Path(args.data_dir).name
-    grid_path = os.path.join(run_dir, env_name, "grid_dense.pt")
+    grid_path = os.path.join(run_dir, env_name, "grid.pt")
     
     if not os.path.exists(grid_path):
         print(f"Warning: Grid not found at {grid_path}.")
@@ -150,7 +95,7 @@ def main():
         found_envs = [d.name for d in Path(run_dir).iterdir() if d.is_dir()]
         if found_envs:
             env_name = found_envs[0]
-            grid_path = os.path.join(run_dir, env_name, "grid_dense.pt")
+            grid_path = os.path.join(run_dir, env_name, "grid.pt")
             print(f"Found and using grid for env: {env_name} at {grid_path}")
         else:
             print(f"Error: No environment grid found in {run_dir}. Exiting.")
@@ -184,11 +129,9 @@ def main():
         scene_bound_min=tuple(config['scene_min']),
         scene_bound_max=tuple(config['scene_max']),
         device=DEVICE,
-        mode="train"
     )
     
-    chk = torch.load(grid_path, map_location=DEVICE)
-    grid.load_state_dict(chk['state_dict'])
+    grid.load_state_dict(torch.load(grid_path, map_location=DEVICE))
     grid.eval()
     print("[INIT] Grid loaded.")
 
