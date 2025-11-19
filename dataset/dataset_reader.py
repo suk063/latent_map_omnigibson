@@ -24,7 +24,7 @@ log.setLevel(20)
 
 gm.RENDER_VIEWER_CAMERA = False
 # gm.ENABLE_HQ_RENDERING = False
-gm.HEADLESS = True
+gm.HEADLESS = False
 
 gm.DEFAULT_VIEWER_WIDTH = 128
 gm.DEFAULT_VIEWER_HEIGHT = 128
@@ -33,12 +33,12 @@ gm.ENABLE_TRANSITION_RULES = False
 FLUSH_EVERY_N_STEPS = 500
 
 
-def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, pos, orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir):
+def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, flow_image, pos, orn, rgb_dir, depth_dir, seg_instance_id_dir, flow_dir, poses_dir):
     frame_filename_base = f"{frame_idx:05d}"
     imageio.imwrite(os.path.join(rgb_dir, f"{frame_filename_base}.png"), rgb_image)
     np.save(os.path.join(depth_dir, f"{frame_filename_base}.npy"), depth_image)
     np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image)
-    # np.save(os.path.join(flow_dir, f"{frame_filename_base}.npy"), flow_image)
+    np.save(os.path.join(flow_dir, f"{frame_filename_base}.npy"), flow_image)
     
     # Construct and save the extrinsic matrix in OpenCV format (world-to-camera)
     R_world_og = Rotation.from_quat(orn.cpu().numpy()).as_matrix()
@@ -63,9 +63,12 @@ class BehaviorDataPlaybackWrapper(DataPlaybackWrapper):
         self.cam_data_dirs = None
         self.sampling_rate = 1
         self.frame_idx = -1
+        self.base_output_dir = None
+        self.cumulative_instance_id_map = {}
 
     def reset(self, *args, **kwargs):
         self.frame_idx = -1
+        self.cumulative_instance_id_map = {}
         return super().reset(*args, **kwargs)
 
     def _process_obs(self, obs, info):
@@ -76,6 +79,23 @@ class BehaviorDataPlaybackWrapper(DataPlaybackWrapper):
         robot = self.env.robots[0]
         base_pose = robot.get_position_orientation()
         cam_rel_poses = []
+        
+
+        # Update and save the instance ID mapping for each camera
+        if self.base_output_dir:
+            if 'obs_info' in info:
+                for robot_obs_info in info['obs_info'].values():
+                    if not isinstance(robot_obs_info, dict):
+                        continue
+                    for camera_obs in robot_obs_info.values():
+                        if isinstance(camera_obs, dict) and 'seg_instance_id' in camera_obs:
+                            id_map = camera_obs['seg_instance_id']
+                            if isinstance(id_map, dict):
+                                self.cumulative_instance_id_map.update(id_map)
+
+            mapping_path = os.path.join(self.base_output_dir, "instance_id_to_name.json")
+            with open(mapping_path, 'w') as f:
+                json.dump(self.cumulative_instance_id_map, f, indent=4)
 
         for camera_name in ROBOT_CAMERA_NAMES["R1Pro"].values():
             # Standard processing from replay_obs.py
@@ -95,11 +115,11 @@ class BehaviorDataPlaybackWrapper(DataPlaybackWrapper):
                     rgb_image = obs[f"{camera_name}::rgb"][..., :3].cpu().numpy().copy()
                     depth = obs[f"{camera_name}::depth_linear"].cpu().numpy().squeeze()
                     seg = obs[f"{camera_name}::seg_instance_id"].cpu().numpy().squeeze()
-                    # flow = obs[f"{camera_name}::flow"].cpu().numpy().squeeze()
+                    flow = obs[f"{camera_name}::flow"].cpu().numpy().squeeze()
                     pos, orn = cam_pose
                     cam_dirs = self.cam_data_dirs[camera_name]
-                    save_data(self.frame_idx, rgb_image, depth, seg, pos, orn,
-                              cam_dirs["rgb"], cam_dirs["depth"], cam_dirs["seg_instance_id"], cam_dirs["poses"])
+                    save_data(self.frame_idx, rgb_image, depth, seg, flow, pos, orn,
+                              cam_dirs["rgb"], cam_dirs["depth"], cam_dirs["seg_instance_id"], cam_dirs["flow"], cam_dirs["poses"])
 
             # Calculate relative pose and add to list (this is saved in HDF5)
             cam_rel_poses.append(th.cat(T.relative_pose_transform(*cam_pose, *base_pose)))
@@ -158,22 +178,22 @@ def replay_hdf5_file(
         depth_dir = os.path.join(output_data_dir, "depth")
         seg_instance_id_dir = os.path.join(output_data_dir, "seg_instance_id")
         poses_dir = os.path.join(output_data_dir, "poses")
-        # flow_dir = os.path.join(output_data_dir, "flow")
+        flow_dir = os.path.join(output_data_dir, "flow")
         os.makedirs(rgb_dir, exist_ok=True)
         os.makedirs(depth_dir, exist_ok=True)
         os.makedirs(seg_instance_id_dir, exist_ok=True)
         os.makedirs(poses_dir, exist_ok=True)
-        # os.makedirs(flow_dir, exist_ok=True)
+        os.makedirs(flow_dir, exist_ok=True)
 
         cam_data_dirs[cam_name] = {
             "rgb": rgb_dir,
             "depth": depth_dir,
             "seg_instance_id": seg_instance_id_dir,
-            # "flow": flow_dir,
+            "flow": flow_dir,
             "poses": poses_dir,
         }
 
-    modalities = ["rgb", "depth_linear", "seg_instance_id"] #, "flow"]
+    modalities = ["rgb", "depth_linear", "seg_instance_id", "flow"]
     robot_sensor_config = {
         "VisionSensor": {
             "modalities": modalities,
@@ -251,6 +271,7 @@ def replay_hdf5_file(
     # Manually set the save directories and sampling rate on the wrapper instance.
     env.cam_data_dirs = cam_data_dirs
     env.sampling_rate = sampling_rate
+    env.base_output_dir = base_output_dir
     
     # Use the original playback_episode method. Data saving is now handled in _process_obs
     env.playback_episode(episode_id=episode_id, record_data=True)
@@ -271,6 +292,7 @@ def main():
     parser.add_argument("--focal_length", type=float, default=17.0, help="Focal length for the camera.")
     parser.add_argument("--image_height", type=int, default=512, help="Image height for the head camera.")
     parser.add_argument("--image_width", type=int, default=512, help="Image width for the head camera.")
+    parser.add_argument("--cameras", nargs='+', default=["head", "left_wrist", "right_wrist"], help="Cameras to replay (e.g., head left_wrist)")
     
     args = parser.parse_args()
     
@@ -278,10 +300,19 @@ def main():
     TASK_ID = args.task_id
     DEMO_ID = args.demo_id
     SAMPLING_RATE = args.sampling_rate
+    
+    # Filter camera_names based on user input
+    all_camera_names = ROBOT_CAMERA_NAMES["R1Pro"]
+    selected_camera_names = {key: val for key, val in all_camera_names.items() if key in args.cameras}
+    if not selected_camera_names:
+        log.warning(f"No valid cameras selected from {args.cameras}. Using all cameras.")
+        selected_camera_names = all_camera_names
+
     replay_hdf5_file(
         data_folder=DATA_FOLDER,
         task_id=TASK_ID,
         demo_id=DEMO_ID,
+        camera_names=selected_camera_names,
         sampling_rate=SAMPLING_RATE,
         horizontal_aperture=args.horizontal_aperture,
         focal_length=args.focal_length,

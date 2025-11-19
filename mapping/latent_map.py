@@ -398,7 +398,7 @@ def main():
             inst_id_valid = inst_id_flat[in_bounds]
 
             # accumulate for visualization (store on CPU to save GPU mem)
-            if config['run_pca'] and env_name == env_names[0]: # Only for the first env
+            if config['run_pca']:
                 epoch_coords[env_name].append(coords_valid.cpu())
             feats_valid = feats_valid[in_bounds].to(DEVICE)
         
@@ -440,6 +440,17 @@ def main():
 
 
         tb_writer.add_scalar("Loss/epoch", avg_loss, epoch + 1)
+
+        # --- Save point cloud for each environment ---
+        if epoch_coords:
+            for env_name, coords_list in epoch_coords.items():
+                if coords_list:
+                    all_coords = torch.cat(coords_list, dim=0).numpy()
+                    env_log_dir = log_dir / env_name
+                    env_log_dir.mkdir(parents=True, exist_ok=True)
+                    save_path = env_log_dir / "point_cloud.npy"
+                    np.save(save_path, all_coords)
+                    print(f"[SAVE] Saved point cloud for {env_name} epoch {epoch+1} to {save_path}")
 
         # --- Periodic PCA Visualization ---
         if config['run_pca'] and config['vis_interval'] > 0 and (epoch + 1) % config['vis_interval'] == 0:

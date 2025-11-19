@@ -67,6 +67,8 @@ def main():
     parser.add_argument("--end_frame", type=int, default=1070, help="The ending frame index.")
     parser.add_argument("--step", type=int, default=5, help="The step between frames.")
     parser.add_argument("--dino_weights_path", type=str, default='dinov3/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth', help="Path to DINOv3 weights file (e.g., dinov3_vith16plus.pt).")
+    parser.add_argument("--config_path", type=str, default="mapping/config.yaml", help="Path to the config file.")
+    parser.add_argument("--run_dir", type=str, default="mapping/map_output/task-0021/runs/task-0021_20251115-032707", help="Path to the run directory.")
     args = parser.parse_args()
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -75,30 +77,28 @@ def main():
     # Load Latent Map Model
     # ==============================================================================================
     # Load config
-    config_path = "mapping/config.yaml"
-    print(f"[INIT] Loading config from {config_path}")
-    with open(config_path, 'r') as f:
+    print(f"[INIT] Loading config from {args.config_path}")
+    with open(args.config_path, 'r') as f:
         config = yaml.safe_load(f)
 
     # Define paths based on config and latest run
     # NOTE: This assumes the latest run is the one to be used.
-    run_dir = "mapping/map_output/task-0021/runs/task-0021_20251114-192217"
-    decoder_path = os.path.join(run_dir, "decoder.pt")
+    decoder_path = os.path.join(args.run_dir, "decoder.pt")
     
     # Try to determine env_name from the data_dir arg
     env_name = Path(args.data_dir).name
-    grid_path = os.path.join(run_dir, env_name, "grid.pt")
+    grid_path = os.path.join(args.run_dir, env_name, "grid.pt")
     
     if not os.path.exists(grid_path):
         print(f"Warning: Grid not found at {grid_path}.")
         # Fallback to the env name found in the runs directory if the one from args doesn't exist
-        found_envs = [d.name for d in Path(run_dir).iterdir() if d.is_dir()]
+        found_envs = [d.name for d in Path(args.run_dir).iterdir() if d.is_dir()]
         if found_envs:
             env_name = found_envs[0]
-            grid_path = os.path.join(run_dir, env_name, "grid.pt")
+            grid_path = os.path.join(args.run_dir, env_name, "grid.pt")
             print(f"Found and using grid for env: {env_name} at {grid_path}")
         else:
-            print(f"Error: No environment grid found in {run_dir}. Exiting.")
+            print(f"Error: No environment grid found in {args.run_dir}. Exiting.")
             return
 
     # Assuming dino model as per default config
@@ -157,6 +157,7 @@ def main():
     rgb_dir = os.path.join(data_dir, "rgb")
     depth_dir = os.path.join(data_dir, "depth")
     poses_dir = os.path.join(data_dir, "poses")
+    seg_instance_id_dir = os.path.join(data_dir, "seg_instance_id")
     intrinsics_path = os.path.join(data_dir, "intrinsics.txt")
 
     # Load camera intrinsics
@@ -173,6 +174,7 @@ def main():
         rgb_files = sorted([os.path.join(rgb_dir, f) for f in os.listdir(rgb_dir) if f.endswith('.png')])
         depth_files = sorted([os.path.join(depth_dir, f) for f in os.listdir(depth_dir) if f.endswith('.npy')])
         pose_files = sorted([os.path.join(poses_dir, f) for f in os.listdir(poses_dir) if f.endswith('.npy')])
+        seg_files = sorted([os.path.join(seg_instance_id_dir, f) for f in os.listdir(seg_instance_id_dir) if f.endswith('.npy')])
     except FileNotFoundError as e:
         print(f"Error: Data directory not found or incomplete. {e}")
         return
@@ -181,9 +183,10 @@ def main():
         rgb_files = rgb_files[:args.end_frame]
         depth_files = depth_files[:args.end_frame]
         pose_files = pose_files[:args.end_frame]
+        seg_files = seg_files[:args.end_frame]
 
-    if len(rgb_files) == 0 or len(depth_files) == 0 or len(pose_files) == 0:
-        print("Error: No rgb/depth/pose files found.")
+    if len(rgb_files) == 0 or len(depth_files) == 0 or len(pose_files) == 0 or len(seg_files) == 0:
+        print("Error: No rgb/depth/pose/segmentation files found.")
         return
 
     all_coords_list = []
@@ -198,6 +201,7 @@ def main():
         rgb_image = imageio.imread(rgb_files[i])
         depth_image = np.load(depth_files[i])
         pose_world_to_cam = np.load(pose_files[i])
+        seg_instance_id_image = np.load(seg_files[i])
         
         h_orig, w_orig, _ = rgb_image.shape
         
@@ -253,19 +257,32 @@ def main():
 
         # 5. Visualize the results for the first frame
         print(f"Visualizing similarity map for frame {i}")
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        
+        # Create a mask for instance IDs between 28 and 34
+        mask = (seg_instance_id_image >= 28) & (seg_instance_id_image <= 29)
+        rgb_with_mask = np.copy(rgb_image)
+        # Highlight the masked pixels in red
+        if np.any(mask):
+            rgb_with_mask[mask] = [255, 0, 0]
+        
+        fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+
         axes[0].imshow(rgb_image)
-        axes[0].set_title("RGB Image")
+        axes[0].set_title("Original RGB")
         axes[0].axis('off')
-
-        im = axes[1].imshow(sim_map, cmap='viridis')
-        axes[1].set_title("Cosine Similarity with Grid Features")
+        
+        axes[1].imshow(rgb_with_mask)
+        axes[1].set_title("RGB with IDs 28-29 Highlighted")
         axes[1].axis('off')
-        fig.colorbar(im, ax=axes[1])
 
-        axes[2].imshow(depth_image, cmap='gray')
-        axes[2].set_title("Depth Image")
+        im = axes[2].imshow(sim_map, cmap='viridis')
+        axes[2].set_title("Cosine Similarity with Grid Features")
         axes[2].axis('off')
+        fig.colorbar(im, ax=axes[2])
+
+        axes[3].imshow(depth_image, cmap='gray')
+        axes[3].set_title("Depth Image")
+        axes[3].axis('off')
 
         plt.tight_layout()
         plt.show()
@@ -285,32 +302,6 @@ def main():
         if coords_valid_frame.shape[0] > 0:
             all_coords_list.append(coords_valid_frame)
             all_feats_list.append(feats_valid_frame)
-
-    if not all_coords_list:
-        print("No valid points found across all frames. Exiting.")
-        return
-        
-    # Combine all points and features
-    combined_coords = np.concatenate(all_coords_list, axis=0)
-    combined_feats = np.concatenate(all_feats_list, axis=0)
-
-    # --------------------------------------------------------------------------- #
-    #  PCA and Visualization
-    # --------------------------------------------------------------------------- #
-    print(f"\n[VIS] Running PCA on {combined_feats.shape[0]} total voxel features...")
-    pca = PCA(n_components=3)
-    feats_pca = pca.fit_transform(combined_feats)
-    scaler = MinMaxScaler()
-    feats_pca_norm = scaler.fit_transform(feats_pca)
-
-    # Create Open3D PointCloud
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(combined_coords)
-    pcd.colors = o3d.utility.Vector3dVector(feats_pca_norm)
-    
-    print("Visualizing the combined point cloud with DINOv3 PCA features...")
-    o3d.visualization.draw_geometries([pcd])
-
 
 if __name__ == "__main__":
     main()
