@@ -144,7 +144,7 @@ parser = argparse.ArgumentParser(description="Map a single environment using a c
 parser.add_argument(
     "--config",
     type=str,
-    default="mapping/config.yaml",
+    default="mapping/config/config.yaml",
     help="Path to the YAML configuration file."
 )
 args = parser.parse_args()
@@ -262,6 +262,12 @@ def main():
     task_name = dataset_path.name
     log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
     tb_writer = SummaryWriter(log_dir=log_dir)
+
+    # Save configuration
+    with open(log_dir / "config.yaml", 'w') as f:
+        yaml.dump(config, f)
+    print(f"[INIT] Saved configuration to {log_dir / 'config.yaml'}")
+
     print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
 
     # --------------------------------------------------------------------------- #

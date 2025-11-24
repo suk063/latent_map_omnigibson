@@ -144,7 +144,7 @@ parser = argparse.ArgumentParser(description="Map a single environment using a c
 parser.add_argument(
     "--config",
     type=str,
-    default="mapping/config.yaml",
+    default="mapping/config/config_sdf.yaml",
     help="Path to the YAML configuration file."
 )
 args = parser.parse_args()
@@ -262,6 +262,12 @@ def main():
     task_name = dataset_path.name
     log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
     tb_writer = SummaryWriter(log_dir=log_dir)
+
+    # Save configuration
+    with open(log_dir / "config.yaml", 'w') as f:
+        yaml.dump(config, f)
+    print(f"[INIT] Saved configuration to {log_dir / 'config.yaml'}")
+
     print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
 
     # --------------------------------------------------------------------------- #
@@ -287,6 +293,17 @@ def main():
         hidden_dim=decoder_config['hidden_dim'],
         output_dim=1,
     ).to(DEVICE)
+
+    # Load SDF settings
+    sdf_config = config.get('sdf', {})
+    SDF_DELTA = sdf_config.get('delta', 0.05)
+    SDF_SIGMA = sdf_config.get('sigma', 0.05)
+    SDF_N_P = sdf_config.get('n_p', 2)
+    SDF_W_S_RECON = sdf_config.get('w_s_recon', 10.0)
+    SDF_W_P_RECON = sdf_config.get('w_p_recon', 2.0)
+    SDF_W_S_EIK = sdf_config.get('w_s_eik', 0.1)
+    SDF_W_P_EIK = sdf_config.get('w_p_eik', 0.03)
+    SDF_W_PROJ = sdf_config.get('w_proj', 10.0)
 
     OPT_LR = config['training']['optimizer_lr']
     
@@ -411,14 +428,14 @@ def main():
             # Ray origins o_j
             o_j = cam_pos.unsqueeze(0).expand_as(q_j) # (N, 3)
             
-            # Free-space points P_F: 1 sample per ray, lambda ~ U(0.05, 0.95)
-            delta = 0.05
+            # Free-space points P_F: 1 sample per ray, lambda ~ U(delta, 1-delta)
+            delta = SDF_DELTA
             lambdas = torch.rand(n_rays, 1, device=DEVICE) * (1 - 2*delta) + delta
             p_f = o_j + lambdas * (q_j - o_j)
             
-            # Perturbed points P_P: 2 samples per ray, alpha ~ N(1, 0.06^2)
-            sigma = 0.05
-            n_p = 2
+            # Perturbed points P_P: n_p samples per ray, alpha ~ N(1, sigma^2)
+            sigma = SDF_SIGMA
+            n_p = SDF_N_P
             alphas = torch.randn(n_rays, n_p, device=DEVICE) * sigma + 1.0
             alphas = torch.clamp(alphas, 1 - 2*sigma, 1 + 2*sigma)
             
@@ -481,11 +498,11 @@ def main():
             l_eik_f   = torch.abs(grad_f - 1.0).mean()
             
             # Total SDF Loss
-            w_s_recon = 10
-            w_p_recon = 2
-            w_s_eik   = 0.1
-            w_p_eik   = 0.03
-            w_proj    = 10
+            w_s_recon = SDF_W_S_RECON
+            w_p_recon = SDF_W_P_RECON
+            w_s_eik   = SDF_W_S_EIK
+            w_p_eik   = SDF_W_P_EIK
+            w_proj    = SDF_W_PROJ
             
             loss_sdf = (w_s_recon * l_recon_s +
                         w_p_recon * l_recon_p +

@@ -33,12 +33,11 @@ gm.ENABLE_TRANSITION_RULES = False
 FLUSH_EVERY_N_STEPS = 500
 
 
-def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, flow_image, pos, orn, rgb_dir, depth_dir, seg_instance_id_dir, flow_dir, poses_dir):
+def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, pos, orn, rgb_dir, depth_dir, seg_instance_id_dir, poses_dir):
     frame_filename_base = f"{frame_idx:05d}"
     imageio.imwrite(os.path.join(rgb_dir, f"{frame_filename_base}.png"), rgb_image)
     np.save(os.path.join(depth_dir, f"{frame_filename_base}.npy"), depth_image)
-    np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image)
-    np.save(os.path.join(flow_dir, f"{frame_filename_base}.npy"), flow_image)
+    np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image.astype(np.int16))
     
     # Construct and save the extrinsic matrix in OpenCV format (world-to-camera)
     R_world_og = Rotation.from_quat(orn.cpu().numpy()).as_matrix()
@@ -115,11 +114,10 @@ class BehaviorDataPlaybackWrapper(DataPlaybackWrapper):
                     rgb_image = obs[f"{camera_name}::rgb"][..., :3].cpu().numpy().copy()
                     depth = obs[f"{camera_name}::depth_linear"].cpu().numpy().squeeze()
                     seg = obs[f"{camera_name}::seg_instance_id"].cpu().numpy().squeeze()
-                    flow = obs[f"{camera_name}::flow"].cpu().numpy().squeeze()
                     pos, orn = cam_pose
                     cam_dirs = self.cam_data_dirs[camera_name]
-                    save_data(self.frame_idx, rgb_image, depth, seg, flow, pos, orn,
-                              cam_dirs["rgb"], cam_dirs["depth"], cam_dirs["seg_instance_id"], cam_dirs["flow"], cam_dirs["poses"])
+                    save_data(self.frame_idx, rgb_image, depth, seg, pos, orn,
+                              cam_dirs["rgb"], cam_dirs["depth"], cam_dirs["seg_instance_id"], cam_dirs["poses"])
 
             # Calculate relative pose and add to list (this is saved in HDF5)
             cam_rel_poses.append(th.cat(T.relative_pose_transform(*cam_pose, *base_pose)))
@@ -178,22 +176,19 @@ def replay_hdf5_file(
         depth_dir = os.path.join(output_data_dir, "depth")
         seg_instance_id_dir = os.path.join(output_data_dir, "seg_instance_id")
         poses_dir = os.path.join(output_data_dir, "poses")
-        flow_dir = os.path.join(output_data_dir, "flow")
         os.makedirs(rgb_dir, exist_ok=True)
         os.makedirs(depth_dir, exist_ok=True)
         os.makedirs(seg_instance_id_dir, exist_ok=True)
         os.makedirs(poses_dir, exist_ok=True)
-        os.makedirs(flow_dir, exist_ok=True)
 
         cam_data_dirs[cam_name] = {
             "rgb": rgb_dir,
             "depth": depth_dir,
             "seg_instance_id": seg_instance_id_dir,
-            "flow": flow_dir,
             "poses": poses_dir,
         }
 
-    modalities = ["rgb", "depth_linear", "seg_instance_id", "flow"]
+    modalities = ["rgb", "depth_linear", "seg_instance_id"]
     robot_sensor_config = {
         "VisionSensor": {
             "modalities": modalities,

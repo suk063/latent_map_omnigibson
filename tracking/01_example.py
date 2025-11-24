@@ -66,6 +66,12 @@ def main():
     parser.add_argument("--end_frame", type=int, default=1070, help="The ending frame index.")
     parser.add_argument("--step", type=int, default=5, help="The step between frames.")
     parser.add_argument("--dino_weights_path", type=str, default='dinov3/dinov3_vith16plus_pretrain_lvd1689m-7c1da9a5.pth', help="Path to DINOv3 weights file (e.g., dinov3_vith16plus.pt).")
+    parser.add_argument(
+        "--run_dir",
+        type=str,
+        required=True,
+        help="Path to the run directory containing trained models (grid.pt, decoder.pt)."
+    )
     args = parser.parse_args()
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,15 +79,23 @@ def main():
     # ==============================================================================================
     # Load Latent Map Model
     # ==============================================================================================
-    # Load config
-    config_path = "mapping/config.yaml"
-    print(f"[INIT] Loading config from {config_path}")
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-
     # Define paths based on config and latest run
-    # NOTE: This assumes the latest run is the one to be used.
-    run_dir = "mapping/map_output/task-0021/runs/task-0021_20251113-193630"
+    run_dir = args.run_dir
+    
+    # Load config
+    # Priority: config.yaml in run_dir > config_path
+    config_file_in_run = os.path.join(run_dir, "config.yaml")
+    config_path = "mapping/config.yaml"
+    
+    if os.path.exists(config_file_in_run):
+        print(f"[INIT] Loading config from run directory: {config_file_in_run}")
+        with open(config_file_in_run, 'r') as f:
+            config = yaml.safe_load(f)
+    else:
+        print(f"[INIT] Config not found in run_dir. Falling back to {config_path}")
+        print(f"[INIT] Loading config from {config_path}")
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
     decoder_path = os.path.join(run_dir, "decoder.pt")
     
     # Try to determine env_name from the data_dir arg

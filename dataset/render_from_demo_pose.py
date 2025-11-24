@@ -74,7 +74,7 @@ def save_data(frame_idx, rgb_image, depth_image, seg_instance_id_image, pos, orn
     frame_filename_base = f"{frame_idx:05d}"
     imageio.imwrite(os.path.join(rgb_dir, f"{frame_filename_base}.png"), rgb_image)
     np.save(os.path.join(depth_dir, f"{frame_filename_base}.npy"), depth_image)
-    np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image)
+    np.save(os.path.join(seg_instance_id_dir, f"{frame_filename_base}.npy"), seg_instance_id_image.astype(np.int16))
     if seg_semantic_image is not None and seg_semantic_dir is not None:
         np.save(os.path.join(seg_semantic_dir, f"{frame_filename_base}.npy"), seg_semantic_image)
     if seg_instance_image is not None and seg_instance_dir is not None:

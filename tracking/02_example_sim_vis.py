@@ -77,9 +77,21 @@ def main():
     # Load Latent Map Model
     # ==============================================================================================
     # Load config
-    print(f"[INIT] Loading config from {args.config_path}")
-    with open(args.config_path, 'r') as f:
-        config = yaml.safe_load(f)
+    # Priority: config.yaml in run_dir > args.config_path
+    config_path = os.path.join(args.run_dir, "config.yaml")
+    if os.path.exists(config_path):
+        print(f"[INIT] Loading config from run directory: {config_path}")
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+    else:
+        print(f"[INIT] Config not found in run_dir. Falling back to {args.config_path}")
+        if os.path.exists(args.config_path):
+            print(f"[INIT] Loading config from {args.config_path}")
+            with open(args.config_path, 'r') as f:
+                config = yaml.safe_load(f)
+        else:
+            print(f"[ERROR] Config file not found at {args.config_path}")
+            return
 
     # Define paths based on config and latest run
     # NOTE: This assumes the latest run is the one to be used.
