@@ -38,7 +38,7 @@ dino_model:
   patch_size: 16
 
 grid:
-  levels: 1
+  levels: 2
   feature_dim: 128
   level_scale: 2.0
   hash_table_size: 2097152  # 2**21

@@ -69,9 +69,6 @@ class _TrainLevel(nn.Module):
 
         self.voxel_features = nn.Parameter(torch.zeros(self.buckets, self.d, device=dev).normal_(0, 0.01))
 
-        self.register_buffer("voxel_instance_ids", torch.zeros(self.buckets, dtype=torch.long, device=dev), persistent=True)
-        self.voxel_instance_ids: torch.Tensor
-
         self.register_buffer("col", torch.tensor(n_collisions, device=self.voxel_features.device), persistent=False)
         self.col: torch.Tensor
 
@@ -94,19 +91,6 @@ class _TrainLevel(nn.Module):
         self.access.zero_()
 
     # ---------- internals
-    def update_instance_ids(self, idxg, inst_ids):
-        vid = (idxg * self.primes).sum(-1) % self.buckets
-        self.voxel_instance_ids[vid] = inst_ids
-
-    def query_instance_ids(self, pts):
-        with torch.no_grad():
-            q = (pts - self.smin) / self.res
-            base = torch.floor(q).long()
-            idx = base[:, None, :] + self.corner_offsets[None, :, :]  # (N, 8, 3)
-
-        vid = (idx * self.primes).sum(-1) % self.buckets  # (N, 8)
-        return self.voxel_instance_ids[vid]
-
     def _lookup(self, idxg, mark_accessed: bool = True):
         vid = (idxg * self.primes).sum(-1) % self.buckets
         if mark_accessed:
@@ -124,12 +108,14 @@ class _TrainLevel(nn.Module):
 
     def query(self, pts, mark_accessed: bool = True):
         with torch.no_grad():
-            q = (pts - self.smin) / self.res
-            base = torch.floor(q).long()
+            q_detached = (pts - self.smin) / self.res
+            base = torch.floor(q_detached).long()
             idx = base[:, None, :] + self.corner_offsets[None, :, :]
 
         feat = self._lookup(idx, mark_accessed=mark_accessed)
 
+        # Recompute q with gradients if needed
+        q = (pts - self.smin) / self.res
         frac = q - base.float()
         wx = torch.stack([1 - frac[:, 0], frac[:, 0]], 1)
         wy = torch.stack([1 - frac[:, 1], frac[:, 1]], 1)
@@ -194,24 +180,6 @@ class VoxelHashTable(nn.Module):
     def reset_access_log(self):
         for lv in self.levels:
             lv.reset_access_log()
-
-    def update_instance_ids(self, pts, inst_ids):
-        # inst_ids is (N,)
-        for lv in self.levels:
-            with torch.no_grad():
-                q = (pts - lv.smin) / lv.res
-                base = torch.floor(q).long()
-                corners_idx = base[:, None, :] + lv.corner_offsets[None, :, :] # (N, 8, 3)
-                # flatten to (N*8, 3)
-                corners_idx_flat = corners_idx.view(-1, 3)
-                # repeat inst_ids to match
-                inst_ids_rep = inst_ids.repeat_interleave(8) # (N*8,)
-            
-            lv.update_instance_ids(corners_idx_flat, inst_ids_rep)
-
-    def query_instance_ids(self, pts):
-        # Query from the finest resolution level
-        return self.levels[-1].query_instance_ids(pts)
 
     def get_scene_bounds(self):
         """Return the scene bounds."""

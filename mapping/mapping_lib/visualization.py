@@ -5,7 +5,96 @@ from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
 import plotly.graph_objects as go
 import os
+from skimage import measure
 
+import open3d as o3d
+
+def save_sdf_mesh_pca(grid, decoder, sdf_decoder, env_name, epoch_label, device, config, output_dir):
+    """
+    Reconstructs mesh from SDF decoder using Marching Cubes, 
+    colors it using PCA of features from the latent decoder,
+    and saves as a .ply file.
+    """
+    print(f"\n[VIS] Generating SDF Mesh + PCA for {env_name} (epoch: {epoch_label}) to save as .ply...")
+    
+    # 1. Define a dense grid for Marching Cubes
+    resolution = 128
+    scene_min = np.array(config['scene_min'])
+    scene_max = np.array(config['scene_max'])
+    
+    margin = 0.05
+    s_min = scene_min - margin
+    s_max = scene_max + margin
+    
+    x = np.linspace(s_min[0], s_max[0], resolution)
+    y = np.linspace(s_min[1], s_max[1], resolution)
+    z = np.linspace(s_min[2], s_max[2], resolution)
+    
+    xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
+    grid_points = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+    
+    # 2. Query SDF in batches
+    sdf_values = []
+    batch_size = 100000 
+    
+    coords_t = torch.from_numpy(grid_points).float().to(device)
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, coords_t.shape[0], batch_size), desc="[VIS] Querying SDF grid"):
+            batch_coords = coords_t[i:i+batch_size]
+            voxel_feat = grid.query_voxel_feature(batch_coords)
+            sdf_out = sdf_decoder(voxel_feat) 
+            sdf_values.append(sdf_out.cpu().numpy())
+            
+    sdf_values = np.concatenate(sdf_values, axis=0).reshape(resolution, resolution, resolution)
+    
+    # 3. Marching Cubes
+    try:
+        verts, faces, normals, values = measure.marching_cubes(sdf_values, level=0.0)
+    except ValueError:
+        print("[VIS] No surface found at level 0.0. Skipping mesh generation.")
+        return
+        
+    scale = (s_max - s_min) / (resolution - 1)
+    verts_world = s_min + verts * scale
+    
+    print(f"[VIS] Mesh generated: {verts_world.shape[0]} vertices, {faces.shape[0]} faces.")
+    
+    # 4. Color mesh using PCA of latent features at vertices
+    verts_t = torch.from_numpy(verts_world).float().to(device)
+    
+    all_feats = []
+    with torch.no_grad():
+        for i in tqdm(range(0, verts_t.shape[0], batch_size), desc="[VIS] Querying Latent Features for Mesh"):
+            batch_coords = verts_t[i:i+batch_size]
+            voxel_feat = grid.query_voxel_feature(batch_coords)
+            feats_t = decoder(voxel_feat)
+            all_feats.append(feats_t.cpu())
+            
+    feats_np = torch.cat(all_feats, dim=0).numpy()
+    
+    # PCA
+    pca = PCA(n_components=3)
+    feats_pca = pca.fit_transform(feats_np)
+    scaler = MinMaxScaler()
+    feats_pca_norm = scaler.fit_transform(feats_pca)
+    
+    # Colors in range [0, 1]
+    colors = feats_pca_norm
+    
+    # 5. Save to .ply
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(verts_world)
+    mesh.triangles = o3d.utility.Vector3iVector(faces)
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+    # mesh.compute_vertex_normals() 
+    
+    save_path = output_dir / env_name
+    save_path.mkdir(parents=True, exist_ok=True)
+    filename = save_path / f"sdf_mesh_pca.ply"
+    
+    o3d.io.write_triangle_mesh(str(filename), mesh)
+    print(f"[VIS] Saved mesh to {filename}")
 
 def run_pca_visualization(server, grid, decoder, coords_list, env_name, epoch_label, device, config):
     """Runs PCA on voxel features and sends them to the Viser server."""

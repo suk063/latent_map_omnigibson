@@ -18,7 +18,7 @@ from mapping_lib.utils import get_3d_coordinates
 from mapping_lib.voxel_hash_table import VoxelHashTable
 from mapping_lib.implicit_decoder import ImplicitDecoder
 from mapping_lib.vision_wrapper import EvaClipWrapper, DINOv3Wrapper
-from mapping_lib.visualization import run_pca_visualization
+from mapping_lib.visualization import run_pca_visualization, save_sdf_mesh_pca
 from torchvision import transforms
 
 
@@ -274,10 +274,18 @@ def main():
     LEVEL_SCALE       = grid_config['level_scale']
     HASH_TABLE_SIZE   = grid_config['hash_table_size']
     RESOLUTION        = grid_config['resolution']
+    # Latent Decoder
     decoder = ImplicitDecoder(
         voxel_feature_dim=GRID_FEAT_DIM * GRID_LVLS,
         hidden_dim=decoder_config['hidden_dim'],
         output_dim=feature_dim,
+    ).to(DEVICE)
+
+    # SDF Decoder
+    sdf_decoder = ImplicitDecoder(
+        voxel_feature_dim=GRID_FEAT_DIM * GRID_LVLS,
+        hidden_dim=decoder_config['hidden_dim'],
+        output_dim=1,
     ).to(DEVICE)
 
     OPT_LR = config['training']['optimizer_lr']
@@ -306,7 +314,7 @@ def main():
         grids[env_name] = grid
 
     # 2. Setup a single optimizer for all grids and the shared decoder
-    all_params = list(decoder.parameters())
+    all_params = list(decoder.parameters()) + list(sdf_decoder.parameters())
     for grid in grids.values():
         all_params.extend(list(grid.parameters()))
     optimizer = torch.optim.Adam(all_params, lr=OPT_LR)
@@ -335,6 +343,8 @@ def main():
     LOG_INTERVAL = config['training']['log_interval']
     for epoch in range(config['training']['epochs']):
         loss_history = []
+        loss_history_latent = []
+        loss_history_sdf = []
         epoch_coords = defaultdict(list)
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config['training']['epochs']}")
@@ -383,30 +393,140 @@ def main():
         
             
             grid = grids[env_name] # Get the correct grid for this environment
+            
+            # --- Latent Feature Loss ---
             voxel_feat = grid.query_voxel_feature(coords_valid)
             pred_feat = decoder(voxel_feat)
-
             cos_sim = F.cosine_similarity(pred_feat, feats_valid, dim=-1)
-            loss = 1.0 - cos_sim.mean()
+            loss_latent = 1.0 - cos_sim.mean()
+
+            # --- SDF Sampling and Loss ---
+            # Camera position in world
+            cam_pos = extrinsic_t[0, 0, :3, 3] # (3,)
+            
+            # Surface points P_S
+            q_j = coords_valid # (N, 3)
+            n_rays = q_j.shape[0]
+            
+            # Ray origins o_j
+            o_j = cam_pos.unsqueeze(0).expand_as(q_j) # (N, 3)
+            
+            # Free-space points P_F: 1 sample per ray, lambda ~ U(0.05, 0.95)
+            delta = 0.05
+            lambdas = torch.rand(n_rays, 1, device=DEVICE) * (1 - 2*delta) + delta
+            p_f = o_j + lambdas * (q_j - o_j)
+            
+            # Perturbed points P_P: 2 samples per ray, alpha ~ N(1, 0.06^2)
+            sigma = 0.05
+            n_p = 2
+            alphas = torch.randn(n_rays, n_p, device=DEVICE) * sigma + 1.0
+            alphas = torch.clamp(alphas, 1 - 2*sigma, 1 + 2*sigma)
+            
+            o_j_exp = o_j.unsqueeze(1).expand(-1, n_p, -1) # (N, 2, 3)
+            q_j_exp = q_j.unsqueeze(1).expand(-1, n_p, -1)
+            p_p = o_j_exp + alphas.unsqueeze(-1) * (q_j_exp - o_j_exp)
+            p_p = p_p.reshape(-1, 3) # (2N, 3)
+            
+            # SDF Ground Truth Approximations
+            # P_S: d(q_j) = 0
+            
+            # P_F: d(p_f) approx dist(p_f, q_j) = (1-lambda) * ||q-o||
+            dist_q_o = torch.norm(q_j - o_j, dim=-1, keepdim=True)
+            d_tilde_f = (1.0 - lambdas) * dist_q_o
+            
+            # P_P: d(p_p) approx dist(p_p, q_j) = (1-alpha) * ||q-o|| (Signed Distance)
+            dist_q_o_exp = dist_q_o.expand(-1, n_p) # (N, 2)
+            d_tilde_p = (1.0 - alphas) * dist_q_o_exp
+            d_tilde_p = d_tilde_p.reshape(-1, 1)
+            
+            # Enable gradients for Eikonal loss
+            # We need to query the grid with these points.
+            # Since q_j comes from no_grad (usually), we need to ensure we can backprop to input of decoder
+            # But Eikonal requires gradient w.r.t POSITION.
+            # So we create new leaf variables or just enforce requires_grad
+            p_s_in = q_j.clone().detach().requires_grad_(True)
+            p_f_in = p_f.clone().detach().requires_grad_(True)
+            p_p_in = p_p.clone().detach().requires_grad_(True)
+            
+            def get_sdf_pred(pts):
+                v_feat = grid.query_voxel_feature(pts)
+                return sdf_decoder(v_feat)
+
+            pred_s = get_sdf_pred(p_s_in)
+            pred_f = get_sdf_pred(p_f_in)
+            pred_p = get_sdf_pred(p_p_in)
+            
+            # Reconstruction Losses
+            l_recon_s = torch.abs(pred_s).mean()
+            l_recon_p = torch.abs(pred_p - d_tilde_p).mean()
+            l_proj    = torch.abs(pred_f - d_tilde_f).mean()
+            
+            # Eikonal Loss (Gradient Norm approx 1)
+            def gradient(y, x):
+                grad = torch.autograd.grad(
+                    y, x, 
+                    grad_outputs=torch.ones_like(y),
+                    create_graph=True, 
+                    retain_graph=True,
+                    only_inputs=True
+                )[0]
+                return torch.norm(grad, dim=-1)
+            
+            grad_s = gradient(pred_s, p_s_in)
+            grad_p = gradient(pred_p, p_p_in)
+            grad_f = gradient(pred_f, p_f_in)
+            
+            grad_sp = torch.cat([grad_s, grad_p])
+            l_eik_s_p = torch.abs(grad_sp - 1.0).mean()
+            l_eik_f   = torch.abs(grad_f - 1.0).mean()
+            
+            # Total SDF Loss
+            w_s_recon = 10
+            w_p_recon = 2
+            w_s_eik   = 0.1
+            w_p_eik   = 0.03
+            w_proj    = 10
+            
+            loss_sdf = (w_s_recon * l_recon_s +
+                        w_p_recon * l_recon_p +
+                        w_s_eik   * l_eik_s_p +
+                        w_p_eik   * l_eik_f +
+                        w_proj    * l_proj)
+            
+            # Combined Loss
+            loss = loss_latent + loss_sdf
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
+            # Log individual losses periodically or just total
+            # For brevity, we stick to total loss logging, but maybe print parts
+
 
             loss_history.append(loss.item())
+            loss_history_latent.append(loss_latent.item())
+            loss_history_sdf.append(loss_sdf.item())
 
 
             global_step = epoch * len(dataloader) + i
             tb_writer.add_scalar("Loss/step", loss.item(), global_step)
+            tb_writer.add_scalar("Loss/latent", loss_latent.item(), global_step)
+            tb_writer.add_scalar("Loss/sdf", loss_sdf.item(), global_step)
 
             if (i + 1) % LOG_INTERVAL == 0:
-                pbar.set_postfix_str(f"Loss: {loss.item():.4f}")
+                pbar.set_postfix_str(f"Total: {loss.item():.4f} | Latent: {loss_latent.item():.4f} | SDF: {loss_sdf.item():.4f}")
         
         avg_loss = sum(loss_history) / len(loss_history) if loss_history else 0
-        print(f"[Epoch {epoch+1}/{config['training']['epochs']}] Avg. Loss: {avg_loss:.4f}")
+        avg_loss_latent = sum(loss_history_latent) / len(loss_history_latent) if loss_history_latent else 0
+        avg_loss_sdf = sum(loss_history_sdf) / len(loss_history_sdf) if loss_history_sdf else 0
+        
+        print(f"[Epoch {epoch+1}/{config['training']['epochs']}] Avg. Loss: {avg_loss:.4f} | Latent: {avg_loss_latent:.4f} | SDF: {avg_loss_sdf:.4f}")
 
 
         tb_writer.add_scalar("Loss/epoch", avg_loss, epoch + 1)
+        tb_writer.add_scalar("Loss/epoch_latent", avg_loss_latent, epoch + 1)
+        tb_writer.add_scalar("Loss/epoch_sdf", avg_loss_sdf, epoch + 1)
 
         # --- Save point cloud for each environment ---
         if epoch_coords:
@@ -422,7 +542,12 @@ def main():
         # --- Periodic PCA Visualization ---
         if config['run_pca'] and config['vis_interval'] > 0 and (epoch + 1) % config['vis_interval'] == 0:
             first_env_name = env_names[0]
+            
+            # Original PCA visualization (Point Cloud)
             run_pca_visualization(server, grids[first_env_name], decoder, epoch_coords[first_env_name], first_env_name, epoch + 1, DEVICE, config)
+            
+            # Run SDF-based Mesh PCA visualization
+            save_sdf_mesh_pca(grids[first_env_name], decoder, sdf_decoder, first_env_name, epoch + 1, DEVICE, config, log_dir)
 
         # --- Save checkpoint after each epoch ---
         for env_name, grid in grids.items():
@@ -435,7 +560,10 @@ def main():
 
         decoder_path = log_dir / "decoder.pt"
         torch.save(decoder.state_dict(), decoder_path)
-        print(f"[SAVE] Saved latest decoder for epoch {epoch+1} to {decoder_path}")
+        
+        sdf_decoder_path = log_dir / "sdf_decoder.pt"
+        torch.save(sdf_decoder.state_dict(), sdf_decoder_path)
+        print(f"[SAVE] Saved latest decoder and sdf_decoder for epoch {epoch+1} to {decoder_path} and {sdf_decoder_path}")
 
 
     # ----------------------------------------------------------------------- #
