@@ -152,6 +152,23 @@ args = parser.parse_args()
 with open(args.config, 'r') as f:
     config = yaml.safe_load(f)
 
+# Check for resume
+load_run_dir = config.get('load_run_dir')
+if load_run_dir:
+    load_run_path = Path(load_run_dir)
+    saved_config_path = load_run_path / "config.yaml"
+    if saved_config_path.exists():
+        print(f"[RESUME] Loading configuration from {saved_config_path}")
+        with open(saved_config_path, 'r') as f:
+            saved_config = yaml.safe_load(f)
+        
+        # Update config with saved_config
+        # We preserve load_run_dir from the current config
+        config = saved_config
+        config['load_run_dir'] = load_run_dir
+    else:
+         print(f"[WARN] Config file not found in {load_run_dir}. Using provided config.")
+
 # --------------------------------------------------------------------------- #
 #  Device                                                                     #
 # --------------------------------------------------------------------------- #
@@ -260,14 +277,19 @@ def main():
     # Pose loading is now handled by the dataset class
     
     task_name = dataset_path.name
-    log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
+    
+    if config.get('load_run_dir'):
+        log_dir = Path(config['load_run_dir'])
+        print(f"[RESUME] Resuming from {log_dir}")
+    else:
+        log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Save configuration
+        with open(log_dir / "config.yaml", 'w') as f:
+            yaml.dump(config, f)
+        print(f"[INIT] Saved configuration to {log_dir / 'config.yaml'}")
+
     tb_writer = SummaryWriter(log_dir=log_dir)
-
-    # Save configuration
-    with open(log_dir / "config.yaml", 'w') as f:
-        yaml.dump(config, f)
-    print(f"[INIT] Saved configuration to {log_dir / 'config.yaml'}")
-
     print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
 
     # --------------------------------------------------------------------------- #
@@ -301,11 +323,11 @@ def main():
     SDF_N_P = sdf_config.get('n_p', 2)
     SDF_W_S_RECON = sdf_config.get('w_s_recon', 10.0)
     SDF_W_P_RECON = sdf_config.get('w_p_recon', 2.0)
-    SDF_W_S_EIK = sdf_config.get('w_s_eik', 0.1)
-    SDF_W_P_EIK = sdf_config.get('w_p_eik', 0.03)
-    SDF_W_PROJ = sdf_config.get('w_proj', 10.0)
+    SDF_W_F_RECON = sdf_config.get('w_f_recon', 10.0)
+    SDF_W_SMOOTH = sdf_config.get('w_smooth', 0.01)
 
     OPT_LR = config['training']['optimizer_lr']
+    EPOCH_START_SDF = config['training'].get('epoch_start_sdf', 0)
     
     # 1. Create VoxelHashTables for each environment
     grids = {}
@@ -329,6 +351,29 @@ def main():
                 print(f"  {level_name}: 0 voxels")
         print("-------------------------------------------------")
         grids[env_name] = grid
+
+    # Load checkpoints if resuming
+    if config.get('load_run_dir'):
+        # Load Decoder
+        decoder_path = log_dir / "decoder.pt"
+        if decoder_path.exists():
+            decoder.load_state_dict(torch.load(decoder_path, map_location=DEVICE))
+            print(f"[RESUME] Loaded decoder from {decoder_path}")
+        
+        # Load SDF Decoder
+        sdf_decoder_path = log_dir / "sdf_decoder.pt"
+        if sdf_decoder_path.exists():
+            sdf_decoder.load_state_dict(torch.load(sdf_decoder_path, map_location=DEVICE))
+            print(f"[RESUME] Loaded sdf_decoder from {sdf_decoder_path}")
+
+        # Load Grids
+        for env_name, grid in grids.items():
+            grid_path = log_dir / env_name / "grid.pt"
+            if grid_path.exists():
+                grid.load_state_dict(torch.load(grid_path, map_location=DEVICE))
+                print(f"[RESUME] Loaded grid for {env_name} from {grid_path}")
+            else:
+                print(f"[WARN] Grid checkpoint not found for {env_name} at {grid_path}")
 
     # 2. Setup a single optimizer for all grids and the shared decoder
     all_params = list(decoder.parameters()) + list(sdf_decoder.parameters())
@@ -418,97 +463,117 @@ def main():
             loss_latent = 1.0 - cos_sim.mean()
 
             # --- SDF Sampling and Loss ---
-            # Camera position in world
-            cam_pos = extrinsic_t[0, 0, :3, 3] # (3,)
-            
-            # Surface points P_S
-            q_j = coords_valid # (N, 3)
-            n_rays = q_j.shape[0]
-            
-            # Ray origins o_j
-            o_j = cam_pos.unsqueeze(0).expand_as(q_j) # (N, 3)
-            
-            # Free-space points P_F: 1 sample per ray, lambda ~ U(delta, 1-delta)
-            delta = SDF_DELTA
-            lambdas = torch.rand(n_rays, 1, device=DEVICE) * (1 - 2*delta) + delta
-            p_f = o_j + lambdas * (q_j - o_j)
-            
-            # Perturbed points P_P: n_p samples per ray, alpha ~ N(1, sigma^2)
-            sigma = SDF_SIGMA
-            n_p = SDF_N_P
-            alphas = torch.randn(n_rays, n_p, device=DEVICE) * sigma + 1.0
-            alphas = torch.clamp(alphas, 1 - 2*sigma, 1 + 2*sigma)
-            
-            o_j_exp = o_j.unsqueeze(1).expand(-1, n_p, -1) # (N, 2, 3)
-            q_j_exp = q_j.unsqueeze(1).expand(-1, n_p, -1)
-            p_p = o_j_exp + alphas.unsqueeze(-1) * (q_j_exp - o_j_exp)
-            p_p = p_p.reshape(-1, 3) # (2N, 3)
-            
-            # SDF Ground Truth Approximations
-            # P_S: d(q_j) = 0
-            
-            # P_F: d(p_f) approx dist(p_f, q_j) = (1-lambda) * ||q-o||
-            dist_q_o = torch.norm(q_j - o_j, dim=-1, keepdim=True)
-            d_tilde_f = (1.0 - lambdas) * dist_q_o
-            
-            # P_P: d(p_p) approx dist(p_p, q_j) = (1-alpha) * ||q-o|| (Signed Distance)
-            dist_q_o_exp = dist_q_o.expand(-1, n_p) # (N, 2)
-            d_tilde_p = (1.0 - alphas) * dist_q_o_exp
-            d_tilde_p = d_tilde_p.reshape(-1, 1)
-            
-            # Enable gradients for Eikonal loss
-            # We need to query the grid with these points.
-            # Since q_j comes from no_grad (usually), we need to ensure we can backprop to input of decoder
-            # But Eikonal requires gradient w.r.t POSITION.
-            # So we create new leaf variables or just enforce requires_grad
-            p_s_in = q_j.clone().detach().requires_grad_(True)
-            p_f_in = p_f.clone().detach().requires_grad_(True)
-            p_p_in = p_p.clone().detach().requires_grad_(True)
-            
-            def get_sdf_pred(pts):
-                v_feat = grid.query_voxel_feature(pts)
-                return sdf_decoder(v_feat)
+            if epoch >= EPOCH_START_SDF:
+                # Camera position in world
+                cam_pos = extrinsic_t[0, 0, :3, 3] # (3,)
+                
+                # Surface points P_S
+                q_j = coords_valid # (N, 3)
+                n_rays = q_j.shape[0]
+                
+                # Ray origins o_j
+                o_j = cam_pos.unsqueeze(0).expand_as(q_j) # (N, 3)
+                
+                # Free-space points P_F: 1 sample per ray, lambda ~ U(delta, 1-delta)
+                delta = SDF_DELTA
+                lambdas = torch.rand(n_rays, 1, device=DEVICE) * (1 - 2*delta) + delta
+                p_f = o_j + lambdas * (q_j - o_j)
+                
+                # Perturbed points P_P: n_p samples per ray, alpha ~ N(1, sigma^2)
+                sigma = SDF_SIGMA
+                n_p = SDF_N_P
+                alphas = torch.randn(n_rays, n_p, device=DEVICE) * sigma + 1.0
+                alphas = torch.clamp(alphas, 1 - 2*sigma, 1 + 2*sigma)
+                
+                o_j_exp = o_j.unsqueeze(1).expand(-1, n_p, -1) # (N, 2, 3)
+                q_j_exp = q_j.unsqueeze(1).expand(-1, n_p, -1)
+                p_p = o_j_exp + alphas.unsqueeze(-1) * (q_j_exp - o_j_exp)
+                p_p = p_p.reshape(-1, 3) # (2N, 3)
+                
+                # SDF Ground Truth Approximations
+                # P_S: d(q_j) = 0
+                
+                # P_F: d(p_f) approx dist(p_f, q_j) = (1-lambda) * ||q-o||
+                dist_q_o = torch.norm(q_j - o_j, dim=-1, keepdim=True)
+                d_tilde_f = (1.0 - lambdas) * dist_q_o
+                
+                # P_P: d(p_p) approx dist(p_p, q_j) = (1-alpha) * ||q-o|| (Signed Distance)
+                dist_q_o_exp = dist_q_o.expand(-1, n_p) # (N, 2)
+                d_tilde_p = (1.0 - alphas) * dist_q_o_exp
+                d_tilde_p = d_tilde_p.reshape(-1, 1)
+                
+                # Enable gradients for Eikonal loss
+                # We need to query the grid with these points.
+                # Since q_j comes from no_grad (usually), we need to ensure we can backprop to input of decoder
+                # But Eikonal requires gradient w.r.t POSITION.
+                # So we create new leaf variables or just enforce requires_grad
+                p_s_in = q_j.clone().detach().requires_grad_(True)
+                p_f_in = p_f.clone().detach().requires_grad_(True)
+                p_p_in = p_p.clone().detach().requires_grad_(True)
+                
+                def get_sdf_pred(pts):
+                    v_feat = grid.query_voxel_feature(pts)
+                    return sdf_decoder(v_feat)
 
-            pred_s = get_sdf_pred(p_s_in)
-            pred_f = get_sdf_pred(p_f_in)
-            pred_p = get_sdf_pred(p_p_in)
+                pred_s = get_sdf_pred(p_s_in)
+                pred_f = get_sdf_pred(p_f_in)
+                pred_p = get_sdf_pred(p_p_in)
+                
+                # Reconstruction Losses
+                l_recon_s = torch.abs(pred_s).mean()
+                l_recon_p = torch.abs(pred_p - d_tilde_p).mean()
+                l_recon_f = torch.abs(pred_f - d_tilde_f).mean()
+                
+                # Eikonal Loss replaced by Smoothness Loss (Gradient Consistency)
+                def gradient(y, x):
+                    grad = torch.autograd.grad(
+                        y, x, 
+                        grad_outputs=torch.ones_like(y),
+                        create_graph=True, 
+                        retain_graph=True,
+                        only_inputs=True
+                    )[0]
+                    return torch.norm(grad, dim=-1)
+                
+                # Perturb p_p_in slightly for curvature/smoothness
+                eps = 1e-3
+                perturbation = torch.randn_like(p_p_in) * eps
+                p_p_pert = (p_p_in.detach() + perturbation).requires_grad_(True)
+                pred_p_pert = get_sdf_pred(p_p_pert)
+                
+                # We need vector gradient for curvature, but 'gradient' returns norm.
+                # Let's implement simple gradient norm smoothness:
+                # Or actually, curvature loss is: mean(abs(grad(x) - grad(x+eps)))
+                # We need the actual gradient vector, not the norm.
+                
+                def gradient_vec(y, x):
+                    grad = torch.autograd.grad(
+                        y, x, 
+                        grad_outputs=torch.ones_like(y),
+                        create_graph=True, 
+                        retain_graph=True,
+                        only_inputs=True
+                    )[0]
+                    return grad
+                
+                grad_p_vec = gradient_vec(pred_p, p_p_in)
+                grad_p_pert_vec = gradient_vec(pred_p_pert, p_p_pert)
+                
+                loss_smooth = (grad_p_vec - grad_p_pert_vec).norm(dim=-1).mean()
+                
+                # Total SDF Loss
+                w_s_recon = SDF_W_S_RECON
+                w_p_recon = SDF_W_P_RECON
+                w_f_recon = SDF_W_F_RECON
+                w_smooth  = SDF_W_SMOOTH
+                
+                loss_sdf = (w_s_recon * l_recon_s +
+                            w_p_recon * l_recon_p +
+                            w_f_recon * l_recon_f +
+                            w_smooth  * loss_smooth)
+            else:
+                loss_sdf = torch.tensor(0.0, device=DEVICE)
             
-            # Reconstruction Losses
-            l_recon_s = torch.abs(pred_s).mean()
-            l_recon_p = torch.abs(pred_p - d_tilde_p).mean()
-            l_proj    = torch.abs(pred_f - d_tilde_f).mean()
-            
-            # Eikonal Loss (Gradient Norm approx 1)
-            def gradient(y, x):
-                grad = torch.autograd.grad(
-                    y, x, 
-                    grad_outputs=torch.ones_like(y),
-                    create_graph=True, 
-                    retain_graph=True,
-                    only_inputs=True
-                )[0]
-                return torch.norm(grad, dim=-1)
-            
-            grad_s = gradient(pred_s, p_s_in)
-            grad_p = gradient(pred_p, p_p_in)
-            grad_f = gradient(pred_f, p_f_in)
-            
-            grad_sp = torch.cat([grad_s, grad_p])
-            l_eik_s_p = torch.abs(grad_sp - 1.0).mean()
-            l_eik_f   = torch.abs(grad_f - 1.0).mean()
-            
-            # Total SDF Loss
-            w_s_recon = SDF_W_S_RECON
-            w_p_recon = SDF_W_P_RECON
-            w_s_eik   = SDF_W_S_EIK
-            w_p_eik   = SDF_W_P_EIK
-            w_proj    = SDF_W_PROJ
-            
-            loss_sdf = (w_s_recon * l_recon_s +
-                        w_p_recon * l_recon_p +
-                        w_s_eik   * l_eik_s_p +
-                        w_p_eik   * l_eik_f +
-                        w_proj    * l_proj)
             
             # Combined Loss
             loss = loss_latent + loss_sdf

@@ -152,6 +152,23 @@ args = parser.parse_args()
 with open(args.config, 'r') as f:
     config = yaml.safe_load(f)
 
+# Check for resume
+load_run_dir = config.get('load_run_dir')
+if load_run_dir:
+    load_run_path = Path(load_run_dir)
+    saved_config_path = load_run_path / "config.yaml"
+    if saved_config_path.exists():
+        print(f"[RESUME] Loading configuration from {saved_config_path}")
+        with open(saved_config_path, 'r') as f:
+            saved_config = yaml.safe_load(f)
+        
+        # Update config with saved_config
+        # We preserve load_run_dir from the current config
+        config = saved_config
+        config['load_run_dir'] = load_run_dir
+    else:
+         print(f"[WARN] Config file not found in {load_run_dir}. Using provided config.")
+
 # --------------------------------------------------------------------------- #
 #  Device                                                                     #
 # --------------------------------------------------------------------------- #
@@ -260,14 +277,19 @@ def main():
     # Pose loading is now handled by the dataset class
     
     task_name = dataset_path.name
-    log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
+    
+    if config.get('load_run_dir'):
+        log_dir = Path(config['load_run_dir'])
+        print(f"[RESUME] Resuming from {log_dir}")
+    else:
+        log_dir = output_path / f"runs/{task_name}_{time.strftime('%Y%m%d-%H%M%S')}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Save configuration
+        with open(log_dir / "config.yaml", 'w') as f:
+            yaml.dump(config, f)
+        print(f"[INIT] Saved configuration to {log_dir / 'config.yaml'}")
+
     tb_writer = SummaryWriter(log_dir=log_dir)
-
-    # Save configuration
-    with open(log_dir / "config.yaml", 'w') as f:
-        yaml.dump(config, f)
-    print(f"[INIT] Saved configuration to {log_dir / 'config.yaml'}")
-
     print(f"[INIT] TensorBoard logging enabled. Log directory: {log_dir}")
 
     # --------------------------------------------------------------------------- #
@@ -310,6 +332,23 @@ def main():
                 print(f"  {level_name}: 0 voxels")
         print("-------------------------------------------------")
         grids[env_name] = grid
+
+    # Load checkpoints if resuming
+    if config.get('load_run_dir'):
+        # Load Decoder
+        decoder_path = log_dir / "decoder.pt"
+        if decoder_path.exists():
+            decoder.load_state_dict(torch.load(decoder_path, map_location=DEVICE))
+            print(f"[RESUME] Loaded decoder from {decoder_path}")
+        
+        # Load Grids
+        for env_name, grid in grids.items():
+            grid_path = log_dir / env_name / "grid.pt"
+            if grid_path.exists():
+                grid.load_state_dict(torch.load(grid_path, map_location=DEVICE))
+                print(f"[RESUME] Loaded grid for {env_name} from {grid_path}")
+            else:
+                print(f"[WARN] Grid checkpoint not found for {env_name} at {grid_path}")
 
     # 2. Setup a single optimizer for all grids and the shared decoder
     all_params = list(decoder.parameters())
