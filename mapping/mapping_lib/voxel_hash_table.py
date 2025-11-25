@@ -123,6 +123,20 @@ class _TrainLevel(nn.Module):
         w = wx[:, [0, 1, 0, 1, 0, 1, 0, 1]] * wy[:, [0, 0, 1, 1, 0, 0, 1, 1]] * wz[:, [0, 0, 0, 0, 1, 1, 1, 1]]
         return (feat * w.unsqueeze(-1)).sum(1)
 
+    @torch.no_grad()
+    def get_voxel_indices(self, pts):
+        """ Returns unique voxel indices accessed by pts. """
+        q_detached = (pts - self.smin) / self.res
+        base = torch.floor(q_detached).long()
+        idx = base[:, None, :] + self.corner_offsets[None, :, :]  # (N, 8, 3)
+        
+        # Flatten to (N*8, 3)
+        idx_flat = idx.view(-1, 3)
+        
+        # Hash
+        vid = (idx_flat * self.primes).sum(-1) % self.buckets
+        return vid.unique()
+
 
 # --------------------------------------------------------------------------- #
 #  public pyramid                                                             #
@@ -190,3 +204,7 @@ class VoxelHashTable(nn.Module):
     def query_feature(self, x: torch.Tensor, scene_id: torch.Tensor, mark_accessed: bool = True) -> torch.Tensor:
         assert scene_id.unique().numel() == 1, "VoxelHashTable can only handle one scene_id"
         return self.query_voxel_feature(x, mark_accessed=mark_accessed)
+
+    @torch.no_grad()
+    def get_voxel_indices(self, pts):
+        return [lv.get_voxel_indices(pts) for lv in self.levels]

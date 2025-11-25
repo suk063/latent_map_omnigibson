@@ -5,6 +5,7 @@ import argparse
 import cv2
 import torch
 import torch.nn.functional as F
+import torch.optim as optim
 import sys
 import open3d as o3d
 
@@ -16,6 +17,7 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import MinMaxScaler
 import tempfile
 import shutil
+import copy
 
 
 # local co-tracker repo (for imports etc. if needed)
@@ -23,6 +25,176 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "..", "co-tracker"))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from mapping.mapping_lib.implicit_decoder import ImplicitDecoder
 from mapping.mapping_lib.voxel_hash_table import VoxelHashTable
+
+
+class SparseLevel:
+    """
+    A single level of sparse voxels.
+    Stores features in Tensors:
+      - coords: (M, 3) LongTensor
+      - features: (M, d) FloatTensor
+    Uses a CPU dictionary for coordinate -> index mapping (fast lookup).
+    """
+    def __init__(self, res, smin, corner_offsets, feature_dim, device):
+        self.res = res
+        self.smin = smin
+        self.corner_offsets = corner_offsets
+        self.d = feature_dim
+        self.device = device
+        
+        # Storage
+        self.coords = None    # (M, 3)
+        self.features = None  # (M, d)
+        self.coord_to_idx = {} # Dict: (x,y,z) -> index in self.features
+
+    def add_features(self, grid_coords: torch.Tensor, features: torch.Tensor):
+        """
+        grid_coords: (M, 3) long
+        features: (M, d) float
+        """
+        self.coords = grid_coords.to(self.device)
+        self.features = features.to(self.device)
+        
+        # Build look-up table on CPU for speed
+        # (Since M is relatively small for a single object, this is efficient)
+        coords_np = grid_coords.cpu().numpy()
+        for i in range(coords_np.shape[0]):
+            key = tuple(coords_np[i])
+            self.coord_to_idx[key] = i
+
+    def query(self, pts: torch.Tensor):
+        """
+        Trilinear interpolation.
+        pts: (N, 3)
+        """
+        N = pts.shape[0]
+        
+        # 1. Compute coordinates and weights
+        q = (pts - self.smin) / self.res
+        base = torch.floor(q).long()
+        
+        # (N, 8, 3)
+        corner_coords = base[:, None, :] + self.corner_offsets[None, :, :]
+        corner_coords_flat = corner_coords.view(-1, 3).cpu().numpy() # (N*8, 3)
+        
+        # 2. Lookup indices
+        # We need to find which of these 8*N corners exist in our sparse grid.
+        # Map coord -> feature index. -1 if not found.
+        indices = np.full(N * 8, -1, dtype=np.int64)
+        
+        # Speed optimization: Only iterate corners, lookup in dict
+        for i in range(N * 8):
+            key = tuple(corner_coords_flat[i])
+            if key in self.coord_to_idx:
+                indices[i] = self.coord_to_idx[key]
+                
+        # 3. Gather features
+        indices_torch = torch.from_numpy(indices).to(self.device)
+        
+        # Mask for valid indices
+        mask = indices_torch >= 0
+        
+        # Output buffer (N*8, d)
+        flat_features = torch.zeros(N * 8, self.d, device=self.device)
+        
+        if mask.any():
+            # Gather valid features from the big tensor
+            valid_indices = indices_torch[mask]
+            flat_features[mask] = self.features[valid_indices]
+            
+        # Reshape to (N, 8, d)
+        corner_features = flat_features.view(N, 8, self.d)
+        
+        # 4. Interpolate
+        frac = q - base.float()
+        wx = torch.stack([1 - frac[:, 0], frac[:, 0]], 1)
+        wy = torch.stack([1 - frac[:, 1], frac[:, 1]], 1)
+        wz = torch.stack([1 - frac[:, 2], frac[:, 2]], 1)
+        
+        w = wx[:, [0, 1, 0, 1, 0, 1, 0, 1]] * \
+            wy[:, [0, 0, 1, 1, 0, 0, 1, 1]] * \
+            wz[:, [0, 0, 0, 0, 1, 1, 1, 1]]
+            
+        return (corner_features * w.unsqueeze(-1)).sum(1)
+
+
+class ObjectGrid:
+    """
+    A structure that holds ONLY the relevant voxels (coordinates + features).
+    Mimics VoxelHashTable's interface for querying.
+    NOW supports rigid body pose (R, t). Queries are transformed to local frame.
+    """
+    def __init__(self, original_grid, points_of_interest, device):
+        self.levels = []
+        self.device = device
+        
+        # Pose: World -> Grid (Canonical)
+        # p_world = R @ p_local + t
+        # p_local = R.T @ (p_world - t)
+        self.R = torch.eye(3, device=device)
+        self.t = torch.zeros(3, device=device)
+        
+        # Extract features for each level
+        for lv_idx, lv_src in enumerate(original_grid.levels):
+            # Create sparse level
+            sparse_lv = SparseLevel(
+                lv_src.res, 
+                lv_src.smin, 
+                lv_src.corner_offsets, 
+                lv_src.d, 
+                device
+            )
+            
+            # 1. Find all voxel coords accessed by points
+            # We duplicate the logic from _TrainLevel.query to get 'idx' (grid coords)
+            with torch.no_grad():
+                pts = points_of_interest.float().to(device)
+                q_detached = (pts - lv_src.smin) / lv_src.res
+                base = torch.floor(q_detached).long()
+                # (N, 8, 3)
+                corner_coords = base[:, None, :] + lv_src.corner_offsets[None, :, :]
+                unique_coords = corner_coords.view(-1, 3).unique(dim=0) # (M, 3)
+            
+            # 2. Retrieve features from original grid using these coords
+            # We need to hash them to find the index in voxel_features
+            vid = (unique_coords * lv_src.primes).sum(-1) % lv_src.buckets
+            features = lv_src.voxel_features[vid] # (M, d)
+            
+            # 3. Add to sparse level
+            if unique_coords.shape[0] > 0:
+                sparse_lv.add_features(unique_coords, features)
+            self.levels.append(sparse_lv)
+            
+            print(f"[SparseGrid] Level {lv_idx}: stored {unique_coords.shape[0]} voxels.")
+
+    def update_pose(self, R: np.ndarray, t: np.ndarray):
+        """
+        Update the grid's pose in the world.
+        R: (3, 3) numpy array
+        t: (3,) numpy array
+        """
+        self.R = torch.from_numpy(R).float().to(self.device)
+        self.t = torch.from_numpy(t).float().to(self.device)
+
+    def query_voxel_feature(self, pts, mark_accessed=False):
+        # pts: (N, 3) in WORLD coordinates
+        
+        # Transform World -> Local (Canonical)
+        # p_local = (p_world - t) @ R
+        # Note: usually p_world = R @ p_local + t
+        # So p_world - t = R @ p_local
+        # R.T @ (p_world - t) = p_local
+        
+        # pts is (N, 3), so we do (pts - t) @ R 
+        # (equivalent to (R.T @ (pts-t).T).T )
+        
+        pts_local = torch.matmul(pts - self.t, self.R)
+        
+        # mark_accessed is ignored for sparse grid
+        feats = []
+        for lv in self.levels:
+            feats.append(lv.query(pts_local))
+        return torch.cat(feats, -1)
 
 
 def draw_geometries_with_key_callbacks(
@@ -45,7 +217,7 @@ def draw_geometries_with_key_callbacks(
         ctr = vis.get_view_control()
         params = ctr.convert_to_pinhole_camera_parameters()
         extrinsic = np.asarray(params.extrinsic)
-        print(f"\n[{window_name}] Camera Extrinsic Pose (copy-paste this):")
+        print(f"\\n[{window_name}] Camera Extrinsic Pose (copy-paste this):")
         print(f"camera_extrinsic = {repr(extrinsic)}")
         return False
 
@@ -842,7 +1014,7 @@ def visualize_pca_open3d(
     pca = PCA(n_components=3)
     pca_result = pca.fit_transform(features_np)
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler = MinMaxScaler(feature_range=(0.1, 1))
     pca_colors = scaler.fit_transform(pca_result)
     
     pcd = o3d.geometry.PointCloud()
@@ -1023,10 +1195,10 @@ def ball_query_and_feature_similarity(
     pcd_ball.colors = o3d.utility.Vector3dVector(colors)
 
     print("[BALL] Displaying ball query and cosine-filtered points in Open3D...")
-    draw_geometries_with_key_callbacks(
-        [pcd_ball],
-        window_name=f"Ball query (r={radius} m) & cosine ≥ {cos_threshold}",
-    )
+    # draw_geometries_with_key_callbacks(
+    #     [pcd_ball],
+    #     window_name=f"Ball query (r={radius} m) & cosine ≥ {cos_threshold}",
+    # )
 
     return {
         "x": x,
@@ -1039,6 +1211,76 @@ def ball_query_and_feature_similarity(
     }
 
 
+def distill_object_features(
+    grid: VoxelHashTable,
+    object_grid: ObjectGrid,
+    decoder: ImplicitDecoder,
+    points_Y_local: np.ndarray, # (Ny, 3)
+    R_final: np.ndarray,
+    t_final: np.ndarray,
+    device: str,
+    lr: float = 0.01,
+    num_steps: int = 500,
+):
+    """
+    Distills features from object_grid (at final pose) to the global grid (at final world coords).
+    """
+    print(f"[DISTILL] Starting distillation to canonical grid... (steps={num_steps}, lr={lr})")
+    
+    # 1. Prepare target features (from ObjectGrid)
+    # Update pose to final
+    object_grid.update_pose(R_final, t_final)
+    
+    # Compute final world coordinates
+    # p_world = p_local @ R^T + t
+    points_Y_world = points_Y_local @ R_final.T + t_final
+    
+    # Get Target Features (Frozen)
+    with torch.no_grad():
+        pts_tensor = torch.from_numpy(points_Y_world).float().to(device)
+        # This queries ObjectGrid, which transforms world->local and gets stored features
+        target_voxel_feats = object_grid.query_voxel_feature(pts_tensor)
+        target_latents = decoder(target_voxel_feats) # (Ny, C)
+        target_latents = F.normalize(target_latents, dim=-1).detach()
+
+    # 2. Optimize Global Grid
+    # We want global_grid(points_Y_world) -> similar to target_latents
+    
+    # Enable gradients for grid
+    grid.train()
+    # Note: ImplicitDecoder is usually frozen here
+    
+    # Explicitly freeze decoder parameters to be safe
+    for param in decoder.parameters():
+        param.requires_grad = False
+    decoder.eval()
+
+    optimizer = optim.Adam(grid.parameters(), lr=lr)
+    
+    for step in range(num_steps):
+        optimizer.zero_grad()
+        
+        # Query global grid at NEW positions
+        global_voxel_feats = grid.query_voxel_feature(pts_tensor, mark_accessed=True) 
+        
+        pred_latents = decoder(global_voxel_feats)
+        pred_latents_norm = F.normalize(pred_latents, dim=-1)
+        
+        # Cosine Similarity Loss: 1 - cos_sim
+        # maximize sum(a*b)
+        cos_sim = (pred_latents_norm * target_latents).sum(dim=-1).mean()
+        loss = 1.0 - cos_sim
+        
+        loss.backward()
+        optimizer.step()
+        
+        if step % 50 == 0:
+            print(f"[DISTILL] Step {step}: Loss = {loss.item():.6f}, CosSim = {cos_sim.item():.6f}")
+
+    print(f"[DISTILL] Finished. Final Loss = {loss.item():.6f}")
+    grid.eval()
+
+
 # ==============================================================================================
 #  NEW: Dynamic PCA visualization every K time steps
 # ==============================================================================================
@@ -1046,10 +1288,10 @@ def ball_query_and_feature_similarity(
 def visualize_dynamic_pca_open3d(
     points_all: np.ndarray,        # P, (N, ≥3), world coords used in latent map
     grid: VoxelHashTable,
+    object_grid: ObjectGrid,  # CHANGED: Now accepts ObjectGrid
     decoder: ImplicitDecoder,
     device: str,
     Y_indices: np.ndarray,         # indices of Y in P
-    f_y: torch.Tensor,             # (|Y|, C) latent features for Y (raw decoder output)
     transforms: list,              # List of (R, t) tuples, one per time step
     step_interval: int = 20,
     max_points: int = 200000,
@@ -1061,25 +1303,10 @@ def visualize_dynamic_pca_open3d(
     """
     Dynamic PCA visualization that runs non-blockingly and saves to video.
       - P: The entire point cloud.
-      - Y: A subset of P (by indices) whose features are fixed to f_y.
-      - P\Y: Features for these points are always queried from grid+decoder.
+      - Y: A subset of P (by indices). Voxels for Y are in object_grid.
+      - P\Y: Features for these points are always queried from global grid.
       - transforms: List of (R, t) such that p_t = R @ p_0 + t.
       - Assumption: All y in Y move according to the rigid transform.
-
-    Implementation:
-      1. Sample points from P (all of Y + a subset of P\Y) -> points_subset.
-      2. For the P\Y sample, query their latent features F(p).
-      3. For Y, use the provided f_y features.
-      4. Concatenate (F(P\Y sample), f_y) and run PCA to get 3D coordinates.
-      5. Normalize these PCA coordinates to the [0, 1] range to use as colors.
-      6. Display the initial state at time t0 and pause, waiting for the user to
-         close the window and press Enter in the console.
-      7. After proceeding, initialize a non-blocking Open3D visualizer.
-      8. For each time step t:
-          - Update point coordinates based on rigid transform.
-          - Update the geometry in the visualizer.
-          - Capture the screen as an image file.
-      9. After the loop, compile all saved image frames into a video.
     """
     if points_all.shape[0] == 0:
         print("[DYN-PCA][ERROR] Empty point cloud P.")
@@ -1123,34 +1350,48 @@ def visualize_dynamic_pca_open3d(
     N_others_sampled = others_sampled.shape[0]
     print(f"[DYN-PCA] Sampling {N_others_sampled} points from P\\Y and keeping all {Ny} points in Y.")
 
-    # Subsets for PCA & visualization (order: others_sampled, Y_indices)
-    indices_subset = np.concatenate([others_sampled, Y_indices])
-    # points_subset_xyz0 = P_xyz[indices_subset]  # (M, 3), at t=0
+    # Pre-separate subsets
+    points_others_xyz0 = P_xyz[others_sampled]    # (N_others_sampled, 3)
+    points_Y_xyz0 = P_xyz[Y_indices]             # (Ny, 3)
 
     # Features:
-    #  - P\Y sampled: query latent map
-    #  - Y: use f_y
-    f_y_np = f_y.detach().cpu().numpy()  # (Ny, C)
+    #  - P\Y sampled: query GLOBAL latent map
+    #  - Y: query OBJECT latent map (at p0)
+    
+    # 1. Others
     if N_others_sampled > 0:
         features_others = compute_features_for_points(
-            P_xyz[others_sampled],
+            points_others_xyz0,
             grid,
             decoder,
             device,
             batch_size=batch_size,
-        )  # (N_others_sampled, C)
+        )
     else:
-        # still need correct feature dim if Ny > 0
-        features_others = np.zeros((0, f_y_np.shape[1]), dtype=np.float32)
+        features_others = np.zeros((0, decoder.output_dim), dtype=np.float32)
 
-    features_subset = np.concatenate([features_others, f_y_np], axis=0)  # (M, C)
+    # 2. Y - Query object_grid
+    # Initialize object_grid pose to Identity (t=0)
+    object_grid.update_pose(np.eye(3), np.zeros(3))
+    
+    # Now we query with WORLD coordinates (which are p0 here), 
+    # and object_grid will transform them to local (p0) internally.
+    features_Y = compute_features_for_points(
+        points_Y_xyz0,
+        object_grid,
+        decoder,
+        device,
+        batch_size=batch_size,
+    )
+
+    features_subset = np.concatenate([features_others, features_Y], axis=0)  # (M, C)
     print(f"[DYN-PCA] Computing PCA on {features_subset.shape[0]} feature vectors.")
 
     # PCA(fixed), colors fixed over time (features are time-invariant)
     pca = PCA(n_components=3)
     pca_result = pca.fit_transform(features_subset)
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler = MinMaxScaler(feature_range=(0.1, 1))
     pca_colors = scaler.fit_transform(pca_result)  # (M, 3)
 
     # Transforms check
@@ -1167,7 +1408,7 @@ def visualize_dynamic_pca_open3d(
     points_Y_xyz0 = P_xyz[Y_indices]             # (Ny, 3)
 
     # --- Initial frame visualization (blocking) ---
-    print(f"\n[DYN-PCA] Displaying initial frame at t={t0}. Close the window to proceed.")
+    # print(f"\n[DYN-PCA] Displaying initial frame at t={t0}. Close the window to proceed.")
     
     # t=0 transform should be identity, but let's apply transforms[0] just in case
     R0, t_vec0 = transforms[t0]
@@ -1187,13 +1428,13 @@ def visualize_dynamic_pca_open3d(
     pcd_initial.points = o3d.utility.Vector3dVector(pts_t0.astype(np.float64))
     pcd_initial.colors = o3d.utility.Vector3dVector(pca_colors.astype(np.float64))
 
-    draw_geometries_with_key_callbacks(
-        [pcd_initial],
-        window_name=f"Dynamic PCA (t={t0}) - Close window to continue",
-        camera_extrinsic=camera_extrinsic,
-    )
+    # draw_geometries_with_key_callbacks(
+    #     [pcd_initial],
+    #     window_name=f"Dynamic PCA (t={t0}) - Close window to continue",
+    #     camera_extrinsic=camera_extrinsic,
+    # )
     
-    input("\nPress Enter to start video recording...")
+    # input("\nPress Enter to start video recording...")
     # --- End of initial frame visualization ---
 
     # time steps to visualize
@@ -1222,7 +1463,21 @@ def visualize_dynamic_pca_open3d(
 
             pts_t = np.vstack([pts_others_t, pts_Y_t])
 
+            # NEW: Update object_grid pose so it follows the object
+            object_grid.update_pose(R, t_vec)
+
             pcd_dyn.points = o3d.utility.Vector3dVector(pts_t.astype(np.float64))
+            # Recalculate features/colors if we wanted dynamic colors, 
+            # but here we use fixed PCA colors based on initial features.
+            # Wait, if we want to prove the grid is moving, we should technically 
+            # re-query features at pts_Y_t using the updated object_grid?
+            # The current PCA colors are fixed from t=0. 
+            # To strictly follow "object_grid is moving", let's re-verify:
+            # - PCA colors were computed at t=0.
+            # - If we re-computed features at t using pts_Y_t and updated object_grid,
+            #   we should get the SAME features (and thus same colors).
+            # - So reusing pca_colors is valid and efficient.
+            
             pcd_dyn.colors = o3d.utility.Vector3dVector(pca_colors.astype(np.float64))
 
             if i == 0:
@@ -1758,21 +2013,74 @@ def main():
     #  Dynamic PCA visualization every 20 steps
     # ==========================================================================================
     if Y_indices.size > 0:
-        visualize_dynamic_pca_open3d(
-            points_all=point_cloud,
-            grid=grid,
-            decoder=decoder,
-            device=device,
-            Y_indices=Y_indices,
-            f_y=f_y,
-            transforms=transforms,
-            step_interval=args.dynamic_pca_interval,
-            max_points=2000000,
-            batch_size=100000,
-            camera_extrinsic=camera_extrinsic_dynamic_pca,
-            output_video_path=args.output_video_path,
-            fps=10,
-        )
+        # NEW: Create ObjectGrid holding ONLY object voxels
+        print("[MAIN] Creating ObjectGrid with only object voxels...")
+        
+        points_Y = point_cloud[Y_indices]
+        if points_Y.shape[1] > 3: 
+            points_Y = points_Y[:, :3]
+            
+        points_Y_tensor = torch.from_numpy(points_Y).float() # .to(device) done inside init
+        
+        object_grid = ObjectGrid(grid, points_Y_tensor, device)
+
+        # visualize_dynamic_pca_open3d(
+        #     points_all=point_cloud,
+        #     grid=grid,
+        #     object_grid=object_grid,
+        #     decoder=decoder,
+        #     device=device,
+        #     Y_indices=Y_indices,
+        #     transforms=transforms,
+        #     step_interval=args.dynamic_pca_interval,
+        #     max_points=2000000,
+        #     batch_size=100000,
+        #     camera_extrinsic=camera_extrinsic_dynamic_pca,
+        #     output_video_path=args.output_video_path,
+        #     fps=10,
+        # )
+        
+        # ==========================================================================================
+        #  Distill moved features back to canonical grid & Visualize
+        # ==========================================================================================
+        if len(transforms) > 0:
+             R_final, t_final = transforms[-1]
+             
+             # Distill
+             distill_object_features(
+                 grid=grid,
+                 object_grid=object_grid,
+                 decoder=decoder,
+                 points_Y_local=points_Y,
+                 R_final=R_final,
+                 t_final=t_final,
+                 device=device,
+             )
+             
+             # Final Visualization with updated grid
+             print("[MAIN] Visualizing updated canonical grid with moved particles...")
+             
+             # Construct final point cloud positions
+             # Background (P \ Y)
+             mask_Y = np.zeros(point_cloud.shape[0], dtype=bool)
+             mask_Y[Y_indices] = True
+             points_bg = point_cloud[~mask_Y]
+             if points_bg.shape[1] > 3: 
+                 points_bg = points_bg[:, :3]
+             
+             # Moved Object (Y transformed)
+             points_Y_final = points_Y @ R_final.T + t_final
+             
+             points_final = np.vstack([points_bg, points_Y_final])
+             
+             visualize_pca_open3d(
+                points_3d=points_final,
+                grid=grid,
+                decoder=decoder,
+                device=device,
+                camera_extrinsic=camera_extrinsic_dynamic_pca,
+             )
+             
     else:
         print("[MAIN] Skipping dynamic PCA because Y is empty.")
 
