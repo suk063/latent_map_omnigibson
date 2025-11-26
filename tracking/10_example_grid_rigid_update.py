@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import sys
 import open3d as o3d
+import json
 
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -18,7 +19,9 @@ from sklearn.preprocessing import MinMaxScaler
 import tempfile
 import shutil
 import copy
-
+from tqdm import tqdm
+from torchvision import transforms
+import open_clip
 
 # local co-tracker repo (for imports etc. if needed)
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "co-tracker"))
@@ -26,6 +29,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from mapping.mapping_lib.implicit_decoder import ImplicitDecoder
 from mapping.mapping_lib.voxel_hash_table import VoxelHashTable
 from mapping.mapping_lib.visualization import save_sdf_mesh_pca
+from mapping.mapping_lib.vision_wrapper import EvaClipWrapper, DINOv3Wrapper
+from mapping.mapping_lib.utils import get_3d_coordinates
 
 
 class SparseLevel:
@@ -663,373 +668,6 @@ def estimate_transforms_over_time(positions_3d: np.ndarray):
     return transforms
 
 
-def visualize_se3_trajectory(
-    transforms: list,
-    centroid: np.ndarray = None,
-    step: int = 5,
-    window_name: str = "SE(3) Trajectory"
-):
-    """
-    Visualizes the estimated SE(3) trajectory using Open3D coordinate frames.
-    
-    Args:
-        transforms: List of (R, t) tuples.
-        centroid: Optional (3,) array. If provided, frames are visualized at R @ centroid + t.
-                  If None, frames are visualized at t (trajectory of the origin).
-        step: Visualize every step-th frame to reduce clutter.
-    """
-    if centroid is None:
-        centroid = np.zeros(3)
-        
-    geometries = []
-    traj_points = []
-    
-    print(f"[VIS] Generating SE(3) visualization for {len(transforms)} steps (stride={step})...")
-    
-    for i in range(0, len(transforms), step):
-        R, t = transforms[i]
-        
-        # Compute position for the frame origin
-        # If centroid is provided, this is the transformed centroid position
-        pos = R @ centroid + t
-        traj_points.append(pos)
-        
-        # Coordinate frame
-        # size=0.1 meters (10cm)
-        mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
-        
-        # Apply pose: first rotate, then translate to 'pos'
-        # Note: create_coordinate_frame makes a frame at (0,0,0).
-        # We want its origin to be at 'pos', and orientation 'R'.
-        T_mat = np.eye(4)
-        T_mat[:3, :3] = R
-        T_mat[:3, 3] = pos
-        
-        mesh_frame.transform(T_mat)
-        geometries.append(mesh_frame)
-
-    # Connect points with a line
-    if len(traj_points) > 1:
-        lines = [[i, i + 1] for i in range(len(traj_points) - 1)]
-        colors = [[1, 0, 0] for _ in range(len(lines))]  # Red trajectory line
-        
-        line_set = o3d.geometry.LineSet(
-            points=o3d.utility.Vector3dVector(traj_points),
-            lines=o3d.utility.Vector2iVector(lines),
-        )
-        line_set.colors = o3d.utility.Vector3dVector(colors)
-        geometries.append(line_set)
-        
-    print(f"[VIS] Displaying {window_name}. Close window to continue...")
-    draw_geometries_with_key_callbacks(geometries, window_name=window_name)
-
-
-# ==============================================================================================
-#  Plotly 3D animation (kept for reference)
-# ==============================================================================================
-
-def _time_to_color(t: int, T: int) -> str:
-    """
-    Simple blue -> red gradient over time.
-    t in [0, T-1]
-    """
-    if T <= 1:
-        return "rgb(0,0,255)"
-    ratio = t / float(T - 1)
-    r = int(255 * ratio)
-    g = 0
-    b = int(255 * (1.0 - ratio))
-    return f"rgb({r},{g},{b})"
-
-
-def visualize_animation_plotly(
-    kp_positions_3d: np.ndarray,   # (T, N, 3) with NaN in invalid
-    kp_colors_rgb: np.ndarray,     # (T, N, 3) uint8
-    pc_positions: list[np.ndarray],  # len T, each (M_t, 3)
-    pc_colors: list[np.ndarray],     # len T, each (M_t, 3)
-    output_html: str,
-):
-    """
-    Not used in the dynamic PCA part, kept for reference.
-    """
-    T, N, _ = kp_positions_3d.shape
-
-    # Initial frame
-    t0 = 0
-    pts0_pc = pc_positions[t0]   # (M0, 3)
-    cols0_pc = pc_colors[t0]     # (M0, 3)
-    pc_color_strings0 = [
-        f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in cols0_pc
-    ]
-
-    data = []
-
-    # dense point cloud at t0
-    if pts0_pc.shape[0] > 0:
-        data.append(
-            go.Scatter3d(
-                x=pts0_pc[:, 0],
-                y=pts0_pc[:, 1],
-                z=pts0_pc[:, 2],
-                mode="markers",
-                marker=dict(size=2, color=pc_color_strings0),
-                name="points_t",
-            )
-        )
-    else:
-        data.append(
-            go.Scatter3d(
-                x=[],
-                y=[],
-                z=[],
-                mode="markers",
-                marker=dict(size=2, color="rgb(150,150,150)"),
-                name="points_t",
-            )
-        )
-
-    # trajectories at t0
-    for n in range(N):
-        pts = kp_positions_3d[: t0 + 1, n, :]
-        mask = ~np.isnan(pts[:, 0])
-        pts_valid = pts[mask]
-        if pts_valid.shape[0] > 0:
-            x_n = pts_valid[:, 0]
-            y_n = pts_valid[:, 1]
-            z_n = pts_valid[:, 2]
-            times = np.arange(0, t0 + 1)[mask]
-        else:
-            x_n = y_n = z_n = []
-            times = []
-
-        data.append(
-            go.Scatter3d(
-                x=x_n,
-                y=y_n,
-                z=z_n,
-                mode="lines+markers",
-                line=dict(width=3, color="rgba(220,220,220,0.8)"),
-                marker=dict(
-                    size=4,
-                    color=times,
-                    colorscale="Viridis",
-                    cmin=0,
-                    cmax=T - 1,
-                    showscale=True if n == 0 and t0 == 0 else False,
-                ),
-                name=f"keypoint_{n}",
-                showlegend=True if n == 0 else False,
-            )
-        )
-
-    frames = []
-    for t in range(T):
-        pts_t_pc = pc_positions[t]
-        cols_t_pc = pc_colors[t]
-        pc_color_strings_t = [
-            f"rgb({int(c[0])},{int(c[1])},{int(c[2])})" for c in cols_t_pc
-        ]
-
-        frame_data = []
-
-        # dense pc
-        if pts_t_pc.shape[0] > 0:
-            frame_data.append(
-                go.Scatter3d(
-                    x=pts_t_pc[:, 0],
-                    y=pts_t_pc[:, 1],
-                    z=pts_t_pc[:, 2],
-                    mode="markers",
-                    marker=dict(size=2, color=pc_color_strings_t),
-                    name="points_t",
-                )
-            )
-        else:
-            frame_data.append(
-                go.Scatter3d(
-                    x=[],
-                    y=[],
-                    z=[],
-                    mode="markers",
-                    marker=dict(size=2, color="rgb(150,150,150)"),
-                    name="points_t",
-                )
-            )
-
-        # trajectories up to t
-        for n in range(N):
-            pts = kp_positions_3d[: t + 1, n, :]
-            mask = ~np.isnan(pts[:, 0])
-            pts_valid = pts[mask]
-            if pts_valid.shape[0] > 0:
-                x_n = pts_valid[:, 0]
-                y_n = pts_valid[:, 1]
-                z_n = pts_valid[:, 2]
-                times = np.arange(0, t + 1)[mask]
-            else:
-                x_n = y_n = z_n = []
-                times = []
-
-            frame_data.append(
-                go.Scatter3d(
-                    x=x_n,
-                    y=y_n,
-                    z=z_n,
-                    mode="lines+markers",
-                    line=dict(width=3, color="rgba(220,220,220,0.8)"),
-                    marker=dict(
-                        size=4,
-                        color=times,
-                        colorscale="Viridis",
-                        cmin=0,
-                        cmax=T - 1,
-                        showscale=False,
-                    ),
-                    name=f"keypoint_{n}",
-                    showlegend=False,
-                )
-            )
-
-        frames.append(go.Frame(data=frame_data, name=str(t)))
-
-    sliders = [
-        {
-            "steps": [
-                {
-                    "args": [[str(t)], {"frame": {"duration": 50, "redraw": True},
-                                        "mode": "immediate"}],
-                    "label": str(t),
-                    "method": "animate",
-                }
-                for t in range(T)
-            ],
-            "transition": {"duration": 0},
-            "x": 0.05,
-            "y": 0,
-            "currentvalue": {"font": {"size": 14}, "prefix": "t = ", "visible": True, "xanchor": "right"},
-            "len": 0.9,
-        }
-    ]
-
-    updatemenus = [
-        {
-            "type": "buttons",
-            "buttons": [
-                {
-                    "label": "Play",
-                    "method": "animate",
-                    "args": [
-                        None,
-                        {
-                            "frame": {"duration": 50, "redraw": True},
-                            "transition": {"duration": 0},
-                            "fromcurrent": True,
-                            "mode": "immediate",
-                        },
-                    ],
-                },
-                {
-                    "label": "Pause",
-                    "method": "animate",
-                    "args": [
-                        [None],
-                        {
-                            "frame": {"duration": 0, "redraw": False},
-                            "mode": "immediate",
-                        },
-                    ],
-                },
-            ],
-            "direction": "left",
-            "pad": {"r": 10, "t": 70},
-            "showactive": True,
-            "x": 0.1,
-            "y": 0,
-            "xanchor": "right",
-            "yanchor": "top",
-        }
-    ]
-
-    fig = go.Figure(data=data, frames=frames)
-    fig.update_layout(
-        title="3D Keypoint Trajectories with Time-Colored Points + Dense RGB Point Cloud",
-        scene=dict(
-            xaxis_title="X (world)",
-            yaxis_title="Y (world)",
-            zaxis_title="Z (world)",
-            aspectmode="data",
-        ),
-        legend=dict(
-            x=0.02,
-            y=0.98,
-            bgcolor="rgba(255,255,255,0.7)",
-        ),
-        sliders=sliders,
-        updatemenus=updatemenus,
-    )
-
-    os.makedirs(os.path.dirname(output_html) or ".", exist_ok=True)
-    pio.write_html(fig, output_html, auto_open=False)
-    print(f"[PLOT] Saved Plotly 3D animation to: {output_html}")
-
-
-# ==============================================================================================
-#  PCA Visualization (latent feature -> color) for static case
-# ==============================================================================================
-
-def visualize_pca_open3d(
-    points_3d: np.ndarray,
-    grid: VoxelHashTable,
-    decoder: ImplicitDecoder,
-    device: str,
-    camera_extrinsic: np.ndarray = None,
-):
-    """
-    Visualizes a point cloud with colors derived from PCA on its latent features using Open3D.
-    """
-    # --- Sampling ---
-    max_points = 2000000
-    if points_3d.shape[0] > max_points:
-        print(f"[PCA] Sampling {max_points} points from the original {points_3d.shape[0]} points.")
-        indices = np.random.choice(points_3d.shape[0], max_points, replace=False)
-        points_3d = points_3d[indices]
-
-    print(f"[PCA] Visualizing PCA of features for {points_3d.shape[0]} points.")
-    
-    # Process in batches to avoid OOM
-    batch_size = 100000
-    all_features = []
-
-    with torch.no_grad():
-        for i in range(0, points_3d.shape[0], batch_size):
-            batch_points = points_3d[i:i+batch_size]
-            points_tensor = torch.from_numpy(batch_points).float().to(device)
-            
-            voxel_feat = grid.query_voxel_feature(points_tensor, mark_accessed=False)
-            pred_feat = decoder(voxel_feat)
-            all_features.append(pred_feat.cpu().numpy())
-
-    features_np = np.concatenate(all_features, axis=0)
-
-    print("[PCA] Running PCA on features...")
-    pca = PCA(n_components=3)
-    pca_result = pca.fit_transform(features_np)
-
-    scaler = MinMaxScaler(feature_range=(0.1, 1))
-    pca_colors = scaler.fit_transform(pca_result)
-    
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_3d)
-    pcd.colors = o3d.utility.Vector3dVector(pca_colors)
-
-    print("[PCA] Displaying point cloud with Open3D...")
-    draw_geometries_with_key_callbacks(
-        [pcd],
-        window_name="PCA of Latent Features",
-        camera_extrinsic=camera_extrinsic,
-    )
-
-
 # ==============================================================================================
 #  Helper: compute features for arbitrary 3D points
 # ==============================================================================================
@@ -1063,7 +701,7 @@ def compute_features_for_points(
 
 
 # ==============================================================================================
-#  NEW: Ball query + latent feature cosine similarity visualization + Y, f_y 반환
+#  NEW: Ball query + latent feature cosine similarity + Y, f_y 반환
 # ==============================================================================================
 
 def ball_query_and_feature_similarity(
@@ -1196,10 +834,10 @@ def ball_query_and_feature_similarity(
     pcd_ball.colors = o3d.utility.Vector3dVector(colors)
 
     print("[BALL] Displaying ball query and cosine-filtered points in Open3D...")
-    # draw_geometries_with_key_callbacks(
-    #     [pcd_ball],
-    #     window_name=f"Ball query (r={radius} m) & cosine ≥ {cos_threshold}",
-    # )
+    draw_geometries_with_key_callbacks(
+        [pcd_ball],
+        window_name=f"Ball query (r={radius} m) & cosine ≥ {cos_threshold}",
+    )
 
     return {
         "x": x,
@@ -1212,356 +850,354 @@ def ball_query_and_feature_similarity(
     }
 
 
-def distill_object_features(
+# ==============================================================================================
+#  ONLINE UPDATE LOGIC (LATENT + SDF)
+# ==============================================================================================
+
+def get_excluded_ids(json_path: str) -> list[int]:
+    """
+    Parses the instance_id_to_name.json and returns a list of IDs (integers)
+    that correspond to 'teddy bear' or 'robot'.
+    """
+    if not os.path.exists(json_path):
+        print(f"[WARN] Instance ID mapping file not found: {json_path}")
+        return []
+
+    with open(json_path, 'r') as f:
+        mapping = json.load(f)
+
+    excluded_ids = []
+    for str_id, name in mapping.items():
+        # Check for keywords
+        # The name is a path like "/World/scene_0/teddy_bear_267/base_link/visuals"
+        name_lower = name.lower()
+        if "teddy_bear" in name_lower or "robot" in name_lower:
+            try:
+                excluded_ids.append(int(str_id))
+            except ValueError:
+                pass
+    
+    return excluded_ids
+
+
+def update_latent_sdf_map_step(
     grid: VoxelHashTable,
-    object_grid: ObjectGrid,
     decoder: ImplicitDecoder,
-    points_Y_local: np.ndarray, # (Ny, 3)
-    R_final: np.ndarray,
-    t_final: np.ndarray,
+    sdf_decoder: ImplicitDecoder,
+    vision_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    rgb_tensor: torch.Tensor,    # (1, 3, H, W) normalized
+    depth_tensor: torch.Tensor,  # (1, 1, H_feat, W_feat)
+    pose_world_to_cam: torch.Tensor, # (4, 4) or (1, 4, 4)
+    seg_map: np.ndarray,         # (H, W)
+    excluded_ids: list[int],
+    intrinsics: tuple,           # (fx, fy, cx, cy)
+    original_image_size: int,
     device: str,
-    lr: float = 0.01,
-    num_steps: int = 500,
+    scene_bounds: tuple,         # (min, max)
+    num_iterations: int = 20,
+    sdf_config: dict = None,
 ):
     """
-    Distills features from object_grid (at final pose) to the global grid (at final world coords).
+    Performs one step of online update for the latent map and SDF map.
     """
-    print(f"[DISTILL] Starting distillation to canonical grid... (steps={num_steps}, lr={lr})")
-    
-    # 1. Prepare target features (from ObjectGrid)
-    # Update pose to final
-    object_grid.update_pose(R_final, t_final)
-    
-    # Compute final world coordinates
-    # p_world = p_local @ R^T + t
-    points_Y_world = points_Y_local @ R_final.T + t_final
-    
-    # Get Target Features (Frozen)
-    with torch.no_grad():
-        pts_tensor = torch.from_numpy(points_Y_world).float().to(device)
-        # This queries ObjectGrid, which transforms world->local and gets stored features
-        target_voxel_feats = object_grid.query_voxel_feature(pts_tensor)
-        target_latents = decoder(target_voxel_feats) # (Ny, C)
-        target_latents = F.normalize(target_latents, dim=-1).detach()
-
-    # 2. Optimize Global Grid
-    # We want global_grid(points_Y_world) -> similar to target_latents
-    
-    # Enable gradients for grid
     grid.train()
-    # Note: ImplicitDecoder is usually frozen here
-    
-    # Explicitly freeze decoder parameters to be safe
-    for param in decoder.parameters():
-        param.requires_grad = False
-    decoder.eval()
+    decoder.eval() # Frozen
+    if sdf_decoder is not None:
+        sdf_decoder.eval() # Frozen
 
-    optimizer = optim.Adam(grid.parameters(), lr=lr)
+    fx, fy, cx, cy = intrinsics
+    scene_min, scene_max = scene_bounds
     
-    for step in range(num_steps):
+    # SDF constants (defaults if config not provided)
+    if sdf_config is None:
+        sdf_config = {}
+    SDF_DELTA = sdf_config.get('delta', 0.05)
+    SDF_SIGMA = sdf_config.get('sigma', 0.05)
+    SDF_N_P = sdf_config.get('n_p', 2)
+    SDF_W_S_RECON = sdf_config.get('w_s_recon', 10.0)
+    SDF_W_P_RECON = sdf_config.get('w_p_recon', 2.0)
+    SDF_W_F_RECON = sdf_config.get('w_f_recon', 10.0)
+    SDF_W_SMOOTH = sdf_config.get('w_smooth', 0.01)
+
+    # 1. Extract Features
+    with torch.no_grad():
+        vis_feat = vision_model(rgb_tensor) # (1, C, Hf, Wf)
+    
+    B, C_, Hf, Wf = vis_feat.shape
+
+    # 2. Compute 3D Coordinates
+    if pose_world_to_cam.dim() == 2:
+        pose_world_to_cam = pose_world_to_cam.unsqueeze(0) # (1, 4, 4)
+    
+    pose_c2w = torch.linalg.inv(pose_world_to_cam)
+    extrinsic_t = pose_c2w[:, :3, :] # (1, 3, 4)
+
+    coords_world, _ = get_3d_coordinates(
+        depth_tensor, extrinsic_t,
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        original_size=original_image_size,
+    ) # (1, 3, Hf, Wf)
+
+    # 3. Filter Points
+    # Reshape
+    feats_valid = vis_feat.permute(0, 2, 3, 1).reshape(-1, C_)
+    coords_valid = coords_world.permute(0, 2, 3, 1).reshape(-1, 3)
+
+    # 3a. Scene Bounds
+    in_x = (coords_valid[:,0] > scene_min[0]) & (coords_valid[:,0] < scene_max[0])
+    in_y = (coords_valid[:,1] > scene_min[1]) & (coords_valid[:,1] < scene_max[1])
+    in_z = (coords_valid[:,2] > scene_min[2]) & (coords_valid[:,2] < scene_max[2])
+    in_bounds = in_x & in_y & in_z
+
+    # 3b. Depth validation
+    depth_flat = depth_tensor.reshape(-1)
+    valid_depth = depth_flat >= 0.01
+    in_bounds = in_bounds & valid_depth
+
+    # 3c. Segmentation Mask (Moving Objects)
+    # Resize seg_map to feature resolution (Hf, Wf)
+    seg_tensor = torch.from_numpy(seg_map).unsqueeze(0).unsqueeze(0).float().to(device) # (1, 1, H, W)
+    seg_resized = F.interpolate(seg_tensor, size=(Hf, Wf), mode='nearest-exact') # (1, 1, Hf, Wf)
+    seg_flat = seg_resized.reshape(-1).cpu().numpy().astype(int)
+    
+    # Identify mask of excluded pixels
+    is_excluded = np.isin(seg_flat, excluded_ids)
+    is_excluded_torch = torch.from_numpy(is_excluded).to(device)
+    
+    # Keep only NOT excluded
+    mask_final = in_bounds & (~is_excluded_torch)
+
+    if mask_final.sum() == 0:
+        return None
+
+    coords_train = coords_valid[mask_final] # (N_valid, 3)
+    feats_target = feats_valid[mask_final]  # (N_valid, C)
+
+    # 4. Optimization Step (Multiple iterations)
+    for _ in range(num_iterations):
         optimizer.zero_grad()
         
-        # Query global grid at NEW positions
-        global_voxel_feats = grid.query_voxel_feature(pts_tensor, mark_accessed=True) 
+        # --- Latent Feature Loss ---
+        voxel_feat = grid.query_voxel_feature(coords_train)
+        pred_feat = decoder(voxel_feat)
+        cos_sim = F.cosine_similarity(pred_feat, feats_target, dim=-1)
+        loss_latent = 1.0 - cos_sim.mean()
         
-        pred_latents = decoder(global_voxel_feats)
-        pred_latents_norm = F.normalize(pred_latents, dim=-1)
-        
-        # Cosine Similarity Loss: 1 - cos_sim
-        # maximize sum(a*b)
-        cos_sim = (pred_latents_norm * target_latents).sum(dim=-1).mean()
-        loss = 1.0 - cos_sim
-        
+        # --- SDF Loss ---
+        loss_sdf = torch.tensor(0.0, device=device)
+        if sdf_decoder is not None:
+            # Camera position in world
+            cam_pos = extrinsic_t[0, :3, 3] # (3,)
+            
+            # Surface points P_S (q_j)
+            q_j = coords_train
+            n_rays = q_j.shape[0]
+            
+            # Ray origins o_j
+            o_j = cam_pos.unsqueeze(0).expand_as(q_j) # (N, 3)
+            
+            # Free-space points P_F: 1 sample per ray, lambda ~ U(delta, 1-delta)
+            delta = SDF_DELTA
+            lambdas = torch.rand(n_rays, 1, device=device) * (1 - 2*delta) + delta
+            p_f = o_j + lambdas * (q_j - o_j)
+            
+            # Perturbed points P_P: n_p samples per ray, alpha ~ N(1, sigma^2)
+            sigma = SDF_SIGMA
+            n_p = SDF_N_P
+            alphas = torch.randn(n_rays, n_p, device=device) * sigma + 1.0
+            alphas = torch.clamp(alphas, 1 - 2*sigma, 1 + 2*sigma)
+            
+            o_j_exp = o_j.unsqueeze(1).expand(-1, n_p, -1) # (N, 2, 3)
+            q_j_exp = q_j.unsqueeze(1).expand(-1, n_p, -1)
+            p_p = o_j_exp + alphas.unsqueeze(-1) * (q_j_exp - o_j_exp)
+            p_p = p_p.reshape(-1, 3) # (N*n_p, 3)
+            
+            # SDF GT Approximations
+            dist_q_o = torch.norm(q_j - o_j, dim=-1, keepdim=True)
+            d_tilde_f = (1.0 - lambdas) * dist_q_o
+            
+            dist_q_o_exp = dist_q_o.expand(-1, n_p)
+            d_tilde_p = (1.0 - alphas) * dist_q_o_exp
+            d_tilde_p = d_tilde_p.reshape(-1, 1)
+            
+            # Enable gradients for Eikonal/Smoothness
+            p_s_in = q_j.clone().detach().requires_grad_(True)
+            p_f_in = p_f.clone().detach().requires_grad_(True)
+            p_p_in = p_p.clone().detach().requires_grad_(True)
+            
+            def get_sdf_pred(pts):
+                v_feat = grid.query_voxel_feature(pts)
+                return sdf_decoder(v_feat)
+
+            pred_s = get_sdf_pred(p_s_in)
+            pred_f = get_sdf_pred(p_f_in)
+            pred_p = get_sdf_pred(p_p_in)
+            
+            # Reconstruction Losses
+            l_recon_s = torch.abs(pred_s).mean()
+            l_recon_p = torch.abs(pred_p - d_tilde_p).mean()
+            l_recon_f = torch.abs(pred_f - d_tilde_f).mean()
+            
+            # Smoothness (Gradient Consistency)
+            eps = 1e-3
+            perturbation = torch.randn_like(p_p_in) * eps
+            p_p_pert = (p_p_in.detach() + perturbation).requires_grad_(True)
+            pred_p_pert = get_sdf_pred(p_p_pert)
+            
+            def gradient_vec(y, x):
+                grad = torch.autograd.grad(
+                    y, x, 
+                    grad_outputs=torch.ones_like(y),
+                    create_graph=True, 
+                    retain_graph=True,
+                    only_inputs=True
+                )[0]
+                return grad
+            
+            grad_p_vec = gradient_vec(pred_p, p_p_in)
+            grad_p_pert_vec = gradient_vec(pred_p_pert, p_p_pert)
+            
+            loss_smooth = (grad_p_vec - grad_p_pert_vec).norm(dim=-1).mean()
+            
+            loss_sdf = (SDF_W_S_RECON * l_recon_s +
+                        SDF_W_P_RECON * l_recon_p +
+                        SDF_W_F_RECON * l_recon_f +
+                        SDF_W_SMOOTH  * loss_smooth)
+
+        # Combined Loss
+        loss = loss_latent + loss_sdf
         loss.backward()
         optimizer.step()
-        
-        if step % 50 == 0:
-            print(f"[DISTILL] Step {step}: Loss = {loss.item():.6f}, CosSim = {cos_sim.item():.6f}")
 
-    print(f"[DISTILL] Finished. Final Loss = {loss.item():.6f}")
-    grid.eval()
+    return coords_train.detach().cpu().numpy()
 
 
-# ==============================================================================================
-#  NEW: Dynamic PCA visualization every K time steps
-# ==============================================================================================
-
-def visualize_dynamic_pca_open3d(
-    points_all: np.ndarray,        # P, (N, ≥3), world coords used in latent map
+def run_online_update(
     grid: VoxelHashTable,
-    object_grid: ObjectGrid,  # CHANGED: Now accepts ObjectGrid
+    decoder: ImplicitDecoder,
+    sdf_decoder: ImplicitDecoder,
+    vision_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    # Data sources
+    rgb_files: list[str],
+    depth_files: list[str],
+    pose_files: list[str],
+    seg_files: list[str],
+    frame_indices: list[int],
+    # Configuration
+    excluded_ids: list[int],
+    intrinsics: tuple,
+    original_image_size: int,
+    scene_bounds: tuple,
+    device: str,
+    transform_func,
+    feature_map_size: int,
+    update_steps: int = 20,
+    sdf_config: dict = None,
+):
+    print(f"[ONLINE] Starting online update loop. Frames: {len(frame_indices)}")
+    
+    for idx in tqdm(frame_indices, desc="Online Update"):
+        # Load data
+        rgb_path = rgb_files[idx]
+        depth_path = depth_files[idx]
+        pose_path = pose_files[idx]
+        seg_path = seg_files[idx]
+
+        rgb_np = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+        rgb_np = cv2.cvtColor(rgb_np, cv2.COLOR_BGR2RGB)
+        depth_np = np.load(depth_path)
+        pose_w2c = np.load(pose_path)
+        seg_map = np.load(seg_path)
+
+        # Prepare tensors
+        img_tensor = torch.from_numpy(rgb_np).permute(2, 0, 1).float() / 255.0
+        img_tensor = transform_func(img_tensor).unsqueeze(0).to(device) # (1, 3, H, W)
+        
+        depth_t = torch.from_numpy(depth_np).unsqueeze(0).unsqueeze(0).float()
+        depth_t = F.interpolate(depth_t, (feature_map_size, feature_map_size), mode="nearest-exact").to(device)
+        
+        pose_tensor = torch.from_numpy(pose_w2c).float().to(device)
+        
+        # Update Map
+        update_latent_sdf_map_step(
+            grid=grid,
+            decoder=decoder,
+            sdf_decoder=sdf_decoder,
+            vision_model=vision_model,
+            optimizer=optimizer,
+            rgb_tensor=img_tensor,
+            depth_tensor=depth_t,
+            pose_world_to_cam=pose_tensor,
+            seg_map=seg_map,
+            excluded_ids=excluded_ids,
+            intrinsics=intrinsics,
+            original_image_size=original_image_size,
+            device=device,
+            scene_bounds=scene_bounds,
+            num_iterations=update_steps,
+            sdf_config=sdf_config,
+        )
+
+    print("[ONLINE] Update finished.")
+
+
+# ==============================================================================================
+#  PCA Visualization (latent feature -> color) for static case
+# ==============================================================================================
+
+def visualize_pca_open3d(
+    points_3d: np.ndarray,
+    grid: VoxelHashTable,
     decoder: ImplicitDecoder,
     device: str,
-    Y_indices: np.ndarray,         # indices of Y in P
-    transforms: list,              # List of (R, t) tuples, one per time step
-    step_interval: int = 20,
-    max_points: int = 200000,
-    batch_size: int = 100000,
     camera_extrinsic: np.ndarray = None,
-    output_video_path: str = "dynamic_pca.mp4",
-    fps: int = 30,
 ):
     """
-    Dynamic PCA visualization that runs non-blockingly and saves to video.
-      - P: The entire point cloud.
-      - Y: A subset of P (by indices). Voxels for Y are in object_grid.
-      - P\Y: Features for these points are always queried from global grid.
-      - transforms: List of (R, t) such that p_t = R @ p_0 + t.
-      - Assumption: All y in Y move according to the rigid transform.
+    Visualizes a point cloud with colors derived from PCA on its latent features using Open3D.
     """
-    if points_all.shape[0] == 0:
-        print("[DYN-PCA][ERROR] Empty point cloud P.")
-        return
+    # --- Sampling ---
+    max_points = 2000000
+    if points_3d.shape[0] > max_points:
+        print(f"[PCA] Sampling {max_points} points from the original {points_3d.shape[0]} points.")
+        indices = np.random.choice(points_3d.shape[0], max_points, replace=False)
+        points_3d = points_3d[indices]
 
-    # Ensure we only use XYZ from P
-    if points_all.shape[1] > 3:
-        P_xyz = points_all[:, :3]
-    else:
-        P_xyz = points_all
-
-    N = P_xyz.shape[0]
-
-    Y_indices = np.unique(Y_indices.astype(np.int64))
-    Ny = Y_indices.shape[0]
-    if Ny == 0:
-        print("[DYN-PCA][WARN] Y is empty (no points with cos ≥ 0.7). Nothing to visualize specially.")
-        return
-
-    print(f"[DYN-PCA] Total points in P: {N}, |Y|: {Ny}")
-
-    # Build sampling for P\Y, ensuring all Y are always included
-    all_indices = np.arange(N, dtype=np.int64)
-    mask_y = np.zeros(N, dtype=bool)
-    mask_y[Y_indices] = True
-    others_idx = all_indices[~mask_y]
-    N_others = others_idx.shape[0]
-
-    # We always include all Y. Others are randomly subsampled up to max_points - Ny.
-    max_points_effective = max(max_points, Ny)
-    max_points_effective = min(max_points_effective, N)  # cannot exceed N
-    max_others = max_points_effective - Ny
-    if max_others < 0:
-        max_others = 0
-
-    if N_others > max_others and max_others > 0:
-        others_sampled = np.random.choice(others_idx, max_others, replace=False)
-    else:
-        others_sampled = others_idx
-
-    N_others_sampled = others_sampled.shape[0]
-    print(f"[DYN-PCA] Sampling {N_others_sampled} points from P\\Y and keeping all {Ny} points in Y.")
-
-    # Pre-separate subsets
-    points_others_xyz0 = P_xyz[others_sampled]    # (N_others_sampled, 3)
-    points_Y_xyz0 = P_xyz[Y_indices]             # (Ny, 3)
-
-    # Features:
-    #  - P\Y sampled: query GLOBAL latent map
-    #  - Y: query OBJECT latent map (at p0)
+    print(f"[PCA] Visualizing PCA of features for {points_3d.shape[0]} points.")
     
-    # 1. Others
-    if N_others_sampled > 0:
-        features_others = compute_features_for_points(
-            points_others_xyz0,
-            grid,
-            decoder,
-            device,
-            batch_size=batch_size,
-        )
-    else:
-        features_others = np.zeros((0, decoder.output_dim), dtype=np.float32)
+    # Process in batches to avoid OOM
+    batch_size = 100000
+    all_features = []
 
-    # 2. Y - Query object_grid
-    # Initialize object_grid pose to Identity (t=0)
-    object_grid.update_pose(np.eye(3), np.zeros(3))
-    
-    # Now we query with WORLD coordinates (which are p0 here), 
-    # and object_grid will transform them to local (p0) internally.
-    features_Y = compute_features_for_points(
-        points_Y_xyz0,
-        object_grid,
-        decoder,
-        device,
-        batch_size=batch_size,
-    )
+    with torch.no_grad():
+        for i in range(0, points_3d.shape[0], batch_size):
+            batch_points = points_3d[i:i+batch_size]
+            points_tensor = torch.from_numpy(batch_points).float().to(device)
+            
+            voxel_feat = grid.query_voxel_feature(points_tensor, mark_accessed=False)
+            pred_feat = decoder(voxel_feat)
+            all_features.append(pred_feat.cpu().numpy())
 
-    features_subset = np.concatenate([features_others, features_Y], axis=0)  # (M, C)
-    print(f"[DYN-PCA] Computing PCA on {features_subset.shape[0]} feature vectors.")
+    features_np = np.concatenate(all_features, axis=0)
 
-    # PCA(fixed), colors fixed over time (features are time-invariant)
+    print("[PCA] Running PCA on features...")
     pca = PCA(n_components=3)
-    pca_result = pca.fit_transform(features_subset)
+    pca_result = pca.fit_transform(features_np)
 
     scaler = MinMaxScaler(feature_range=(0.1, 1))
-    pca_colors = scaler.fit_transform(pca_result)  # (M, 3)
-
-    # Transforms check
-    T = len(transforms)
-    if T == 0:
-        print("[DYN-PCA][ERROR] Empty transforms list.")
-        return
+    pca_colors = scaler.fit_transform(pca_result)
     
-    t0 = 0
-    print(f"[DYN-PCA] Using t0 = {t0} as reference frame (assuming R=I, t=0).")
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_3d)
+    pcd.colors = o3d.utility.Vector3dVector(pca_colors)
 
-    # Pre-separate subsets for convenience
-    points_others_xyz0 = P_xyz[others_sampled]    # (N_others_sampled, 3)
-    points_Y_xyz0 = P_xyz[Y_indices]             # (Ny, 3)
-
-    # --- Initial frame visualization (blocking) ---
-    # print(f"\n[DYN-PCA] Displaying initial frame at t={t0}. Close the window to proceed.")
-    
-    # t=0 transform should be identity, but let's apply transforms[0] just in case
-    R0, t_vec0 = transforms[t0]
-    
-    # Static background (others) - assumes they don't move or we only move Y?
-    # The requirement is "selected particles move", so others are static?
-    # Original code kept others static: pts_others_t = points_others_xyz0
-    pts_others_t0 = points_others_xyz0
-
-    # Apply transform to Y
-    # points_Y_xyz0 is (Ny, 3)
-    pts_Y_t0 = points_Y_xyz0 @ R0.T + t_vec0
-
-    pts_t0 = np.vstack([pts_others_t0, pts_Y_t0])
-
-    pcd_initial = o3d.geometry.PointCloud()
-    pcd_initial.points = o3d.utility.Vector3dVector(pts_t0.astype(np.float64))
-    pcd_initial.colors = o3d.utility.Vector3dVector(pca_colors.astype(np.float64))
-
-    # draw_geometries_with_key_callbacks(
-    #     [pcd_initial],
-    #     window_name=f"Dynamic PCA (t={t0}) - Close window to continue",
-    #     camera_extrinsic=camera_extrinsic,
-    # )
-    
-    # input("\nPress Enter to start video recording...")
-    # --- End of initial frame visualization ---
-
-    # time steps to visualize
-    time_steps = list(range(t0, T, step_interval))
-    print(f"[DYN-PCA] Visualizing and recording {len(time_steps)} time steps...")
-
-    # Non-blocking visualization and recording
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="Dynamic PCA of Latent Features (Recording)")
-    temp_dir = tempfile.mkdtemp()
-    frame_files = []
-    pcd_dyn = o3d.geometry.PointCloud()
-
-    try:
-        for i, t in enumerate(time_steps):
-            if t >= T:
-                continue
-
-            R, t_vec = transforms[t]
-
-            # Others stay static
-            pts_others_t = points_others_xyz0
-            
-            # Y moves with rigid transform
-            pts_Y_t = points_Y_xyz0 @ R.T + t_vec
-
-            pts_t = np.vstack([pts_others_t, pts_Y_t])
-
-            # NEW: Update object_grid pose so it follows the object
-            object_grid.update_pose(R, t_vec)
-
-            pcd_dyn.points = o3d.utility.Vector3dVector(pts_t.astype(np.float64))
-            # Recalculate features/colors if we wanted dynamic colors, 
-            # but here we use fixed PCA colors based on initial features.
-            # Wait, if we want to prove the grid is moving, we should technically 
-            # re-query features at pts_Y_t using the updated object_grid?
-            # The current PCA colors are fixed from t=0. 
-            # To strictly follow "object_grid is moving", let's re-verify:
-            # - PCA colors were computed at t=0.
-            # - If we re-computed features at t using pts_Y_t and updated object_grid,
-            #   we should get the SAME features (and thus same colors).
-            # - So reusing pca_colors is valid and efficient.
-            
-            pcd_dyn.colors = o3d.utility.Vector3dVector(pca_colors.astype(np.float64))
-
-            if i == 0:
-                vis.add_geometry(pcd_dyn)
-                if camera_extrinsic is not None:
-                    ctr = vis.get_view_control()
-                    params = ctr.convert_to_pinhole_camera_parameters()
-                    params.extrinsic = camera_extrinsic
-                    ctr.convert_from_pinhole_camera_parameters(params, False)
-            else:
-                vis.update_geometry(pcd_dyn)
-
-            vis.poll_events()
-            vis.update_renderer()
-
-            frame_path = os.path.join(temp_dir, f"frame_{i:05d}.png")
-            vis.capture_screen_image(frame_path, do_render=True)
-            frame_files.append(frame_path)
-
-        # Create video from frames
-        if frame_files:
-            print(f"[DYN-PCA] Creating video from {len(frame_files)} frames...")
-            output_dir = os.path.dirname(output_video_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-
-            with imageio.get_writer(output_video_path, fps=fps) as writer:
-                for frame_file in frame_files:
-                    writer.append_data(imageio.imread(frame_file))
-            print(f"[DYN-PCA] Video saved to: {output_video_path}")
-        else:
-            print("[DYN-PCA][WARN] No frames were recorded.")
-
-    finally:
-        vis.destroy_window()
-        shutil.rmtree(temp_dir)
-        print(f"[DYN-PCA] Cleaned up temporary directory: {temp_dir}")
-
-
-# ==============================================================================================
-#  2D Tracks Visualization
-# ==============================================================================================
-
-def visualize_2d_tracks_video(
-    frames_np: np.ndarray,
-    tracks_xy: np.ndarray,
-    visibilities: np.ndarray,
-    output_path: str,
-    fps: int = 10,
-):
-    """
-    Visualizes 2D tracks on the video frames and saves as a video.
-    """
-    print(f"[VIS] Saving 2D tracks video to {output_path}...")
-    T, N, _ = tracks_xy.shape
-    if T == 0:
-        return
-
-    # Generate random colors for each keypoint (RGB)
-    np.random.seed(42)
-    colors = np.random.randint(0, 255, size=(N, 3), dtype=np.uint8)
-
-    writer = imageio.get_writer(output_path, fps=fps)
-
-    for t in range(T):
-        img = frames_np[t].copy()
-        
-        for n in range(N):
-            vis = visibilities[t, n]
-            if vis > 0.5:
-                x, y = tracks_xy[t, n]
-                if np.isnan(x) or np.isnan(y):
-                    continue
-                
-                color = (int(colors[n, 0]), int(colors[n, 1]), int(colors[n, 2]))
-                
-                # Draw point
-                cv2.circle(img, (int(x), int(y)), 4, color, -1)
-        
-        writer.append_data(img)
-
-    writer.close()
-    print(f"[VIS] Saved 2D tracks video to {output_path}")
+    print("[PCA] Displaying point cloud with Open3D...")
+    draw_geometries_with_key_callbacks(
+        [pcd],
+        window_name="PCA of Latent Features",
+        camera_extrinsic=camera_extrinsic,
+    )
 
 
 # ==============================================================================================
@@ -1573,7 +1209,7 @@ def main():
         description=(
             "Select one keypoint, backproject to 3D, find nearest latent point x, "
             "run 10cm ball query B(x), define Y (cos ≥ 0.7), store F(y) as f_y, "
-            "track x with CoTracker, assume Y moves with x, and visualize dynamic PCA every 20 steps."
+            "track x with CoTracker, then run ONLINE UPDATE of Latent+SDF map using images."
         )
     )
     parser.add_argument(
@@ -1606,12 +1242,6 @@ def main():
         type=str,
         default="cuda",
         help="Device for models: 'cuda' or 'cpu'.",
-    )
-    parser.add_argument(
-        "--output_html",
-        type=str,
-        default="trajectories_animation.html",
-        help="(Optional) Output HTML file path for Plotly 3D visualization.",
     )
     parser.add_argument(
         "--pc_stride",
@@ -1650,28 +1280,16 @@ def main():
         help="Cosine similarity threshold for 'high sim' visualization in B(x)."
     )
     parser.add_argument(
-        "--dynamic_pca_interval",
+        "--update_steps",
         type=int,
-        default=1,
-        help="Do dynamic PCA visualization every this many time steps."
-    )
-    parser.add_argument(
-        "--output_video_path",
-        type=str,
-        default="dynamic_pca_video.mp4",
-        help="Path to save the dynamic PCA visualization video."
-    )
-    parser.add_argument(
-        "--output_2d_video_path",
-        type=str,
-        default="cotracker_2d_visualization.mp4",
-        help="Path to save the 2D tracks visualization video."
+        default=20,
+        help="Number of optimization steps per time-step."
     )
     args = parser.parse_args()
 
     # Placeholders for custom camera poses.
     # Press 'P' in an Open3D window to print the pose, then copy-paste it here.
-    camera_extrinsic_dynamic_pca = np.array([[  0.73498117,   0.67314058,  -0.08175842, -20.85476113],
+    camera_extrinsic_vis = np.array([[  0.73498117,   0.67314058,  -0.08175842, -20.85476113],
        [  0.04048914,  -0.16392308,  -0.98564185,   1.30857798],
        [ -0.67687762,   0.72111787,  -0.14773526,  12.67379289],
        [  0.        ,   0.        ,   0.        ,   1.        ]])
@@ -1732,12 +1350,48 @@ def main():
             print(f" - point_cloud.npy not found in any env subdirectory")
         return
 
-    # 3. Load model configs
+    # 3. Load model configs & Vision Model
     if config['model_type'] == "clip":
-        feature_dim = config['clip_model']['feature_dim']
+        model_config = config['clip_model']
+        image_size = model_config['image_size']
+        patch_size = model_config['patch_size']
+        feature_dim = model_config['feature_dim']
+        
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+        ])
+        
+        clip_model_name  = model_config['name']
+        clip_weights_id  = model_config['weights_id']
+        clip_model, _, _ = open_clip.create_model_and_transforms(
+            clip_model_name, pretrained=clip_weights_id
+        )
+        clip_model = clip_model.to(device).eval()
+        vision_model = EvaClipWrapper(clip_model, output_dim=feature_dim).to(device).eval()
+        print("[INIT] Loaded EVA-CLIP model.")
+
     elif config['model_type'] == "dino":
-        # For DINOv3 ViT-H/16plus, the feature dimension is 1280.
-        feature_dim = 1280
+        model_config = config['dino_model']
+        image_size = model_config['image_size']
+        patch_size = model_config['patch_size']
+        
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True),
+        ])
+
+        # Load DINOv3 backbone and initialize model
+        WEIGHT_PATH = model_config['weights_path']
+        repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'dinov3'))
+        if not os.path.exists(repo_dir):
+             print(f"[WARN] dinov3 repo not found at {repo_dir}, trying 'dinov3' in current path or torch hub default")
+             repo_dir = 'dinov3' # fall back
+
+        print(f"[INIT] Loading DINOv3 from {repo_dir}")
+        # Note: torch.hub.load with source='local' expects path to repo
+        backbone = torch.hub.load(repo_dir, 'dinov3_vith16plus', source='local', weights=WEIGHT_PATH)
+        vision_model = DINOv3Wrapper(backbone).to(device).eval()
+        feature_dim = vision_model.feature_dim
+        print(f"[INIT] Loaded DINOv3 model with feature dimension {feature_dim}.")
     else:
         raise ValueError(f"Unknown model type in config: {config['model_type']}")
 
@@ -1752,7 +1406,9 @@ def main():
     ).to(device)
     decoder.load_state_dict(torch.load(decoder_path, map_location=device))
     decoder.eval()
-    print("[INIT] Decoder loaded.")
+    for param in decoder.parameters():
+        param.requires_grad = False
+    print("[INIT] Decoder loaded and frozen.")
 
     # Load SDF Decoder (Optional, for visualization)
     sdf_decoder_path = os.path.join(args.run_dir, "sdf_decoder.pt")
@@ -1766,8 +1422,11 @@ def main():
         ).to(device)
         sdf_decoder.load_state_dict(torch.load(sdf_decoder_path, map_location=device))
         sdf_decoder.eval()
+        for param in sdf_decoder.parameters():
+            param.requires_grad = False
+        print("[INIT] SDF Decoder loaded and frozen.")
     else:
-        print(f"[WARN] sdf_decoder.pt not found at {sdf_decoder_path}. SDF visualization will be skipped.")
+        print(f"[WARN] sdf_decoder.pt not found at {sdf_decoder_path}. SDF update/visualization will be skipped.")
 
     # Load Grid
     print(f"[INIT] Loading grid from {grid_path}")
@@ -1782,8 +1441,13 @@ def main():
         device=device,
     )
     grid.load_state_dict(torch.load(grid_path, map_location=device))
-    grid.eval()
+    grid.train() # Trainable for online update
     print("[INIT] Grid loaded.")
+    
+    # Optimizer for Grid
+    OPT_LR = config['training']['optimizer_lr']
+    optimizer = torch.optim.Adam(grid.parameters(), lr=OPT_LR)
+    print(f"[INIT] Optimizer initialized with LR={OPT_LR}")
 
     # 4. Load point cloud (latent map coordinates)
     print(f"[INIT] Loading point cloud from {point_cloud_path}")
@@ -1796,7 +1460,13 @@ def main():
     rgb_dir = os.path.join(data_dir, "rgb")
     depth_dir = os.path.join(data_dir, "depth")
     poses_dir = os.path.join(data_dir, "poses")
+    seg_dir = os.path.join(data_dir, "seg_instance_id")
     intrinsics_path = os.path.join(data_dir, "intrinsics.txt")
+    
+    # Load instance ID mapping
+    instance_id_json = os.path.join(args.data_dir, "instance_id_to_name.json")
+    excluded_ids = get_excluded_ids(instance_id_json)
+    print(f"[INIT] Excluded IDs (moving objects): {excluded_ids}")
 
     # Load intrinsics
     if not os.path.exists(intrinsics_path):
@@ -1813,44 +1483,34 @@ def main():
     # Load file lists (RGB, depth, pose)
     try:
         rgb_files = sorted(
-            [
-                os.path.join(rgb_dir, f)
-                for f in os.listdir(rgb_dir)
-                if f.endswith(".png")
-            ]
+            [os.path.join(rgb_dir, f) for f in os.listdir(rgb_dir) if f.endswith(".png")]
         )
         depth_files = sorted(
-            [
-                os.path.join(depth_dir, f)
-                for f in os.listdir(depth_dir)
-                if f.endswith(".npy")
-            ]
+            [os.path.join(depth_dir, f) for f in os.listdir(depth_dir) if f.endswith(".npy")]
         )
         pose_files = sorted(
-            [
-                os.path.join(poses_dir, f)
-                for f in os.listdir(poses_dir)
-                if f.endswith(".npy")
-            ]
+            [os.path.join(poses_dir, f) for f in os.listdir(poses_dir) if f.endswith(".npy")]
+        )
+        seg_files = sorted(
+            [os.path.join(seg_dir, f) for f in os.listdir(seg_dir) if f.endswith(".npy")]
         )
     except FileNotFoundError as e:
         print(f"[ERROR] Data directory not found or incomplete. {e}")
         return
 
-    if not (rgb_files and depth_files and pose_files):
-        print("[ERROR] One of rgb/depth/pose is missing or empty.")
+    if not (rgb_files and depth_files and pose_files and seg_files):
+        print("[ERROR] One of rgb/depth/pose/seg is missing or empty.")
         return
 
     num_frames = len(rgb_files)
-    if not (len(depth_files) == num_frames and len(pose_files) == num_frames):
-        print(
-            f"[WARN] Number of frames differ: rgb={len(rgb_files)}, "
-            f"depth={len(depth_files)}, pose={len(pose_files)}"
-        )
-        num_frames = min(len(rgb_files), len(depth_files), len(pose_files))
+    min_len = min(len(rgb_files), len(depth_files), len(pose_files), len(seg_files))
+    if min_len < num_frames:
+        print(f"[WARN] File counts differ. Truncating to {min_len} frames.")
+        num_frames = min_len
         rgb_files = rgb_files[:num_frames]
         depth_files = depth_files[:num_frames]
         pose_files = pose_files[:num_frames]
+        seg_files = seg_files[:num_frames]
 
     # Check start_frame / end_frame
     start = args.start_frame
@@ -1931,10 +1591,10 @@ def main():
         cos_threshold=args.cos_threshold,
     )
     Y_indices = ball_res["Y_indices"]
-    f_y = ball_res["f_y"]
+    # f_y = ball_res["f_y"]
 
     if Y_indices.size == 0:
-        print("[MAIN][WARN] Y is empty (no points with cos ≥ 0.7). Dynamic PCA will be skipped.")
+        print("[MAIN][WARN] Y is empty (no points with cos ≥ 0.7).")
     else:
         print(f"[MAIN] |Y| = {Y_indices.shape[0]}")
 
@@ -1972,15 +1632,6 @@ def main():
             "Will use the min length."
         )
 
-    # Visualize 2D tracks
-    # visualize_2d_tracks_video(
-    #     frames_np=frames_np,
-    #     tracks_xy=tracks_xy,
-    #     visibilities=visibilities,
-    #     output_path=args.output_2d_video_path,
-    #     fps=10,
-    # )
-
     # Compute 3D trajectory for ALL keypoints
     positions_3d, colors_rgb, pc_positions, pc_colors = compute_3d_positions_and_colors_over_time(
         frames_np=frames_np,
@@ -1997,139 +1648,101 @@ def main():
         point_stride=args.pc_stride,
     )
     
-    # positions_3d: (T_eff, N, 3)
     # Estimate rigid transforms from ALL keypoint trajectories
-    transforms = estimate_transforms_over_time(positions_3d)
+    rigid_transforms = estimate_transforms_over_time(positions_3d)
 
     # ==========================================================================================
-    #  Visualize SE(3) Trajectory (Coordinate Frames)
+    #  Online Update (Latent + SDF)
     # ==========================================================================================
-    # pts_0 = positions_3d[0]
-    # valid_0 = ~np.isnan(pts_0[:, 0])
-    # if np.any(valid_0):
-    #     centroid_0 = np.mean(pts_0[valid_0], axis=0)
-    #     # Visualize every 5th frame to avoid clutter
-    #     visualize_se3_trajectory(transforms, centroid=centroid_0, step=5)
-    # else:
-    #     print("[WARN] Cannot visualize SE(3) trajectory: no valid points at t=0.")
+    
+    # We use the transforms to identify where the object is, but the update uses full image
+    # minus excluded IDs (which should cover the object if properly segmented).
+    # Update happens for each selected frame.
+    
+    run_online_update(
+        grid=grid,
+        decoder=decoder,
+        sdf_decoder=sdf_decoder,
+        vision_model=vision_model,
+        optimizer=optimizer,
+        rgb_files=rgb_files,
+        depth_files=depth_files,
+        pose_files=pose_files,
+        seg_files=seg_files,
+        frame_indices=frame_indices,
+        excluded_ids=excluded_ids,
+        intrinsics=(fx_orig, fy_orig, cx_orig, cy_orig),
+        original_image_size=config['dataset']['original_image_size'],
+        scene_bounds=(tuple(config['scene_min']), tuple(config['scene_max'])),
+        device=device,
+        transform_func=transform,
+        feature_map_size=image_size // patch_size,
+        update_steps=args.update_steps,
+        sdf_config=config.get('sdf', None),
+    )
 
     # ==========================================================================================
-    #  Visualize Keypoint Trajectories + Point Cloud (Plotly HTML)
+    #  Final Visualization
     # ==========================================================================================
-    # print(f"[PLOT] Generating Plotly HTML animation: {args.output_html}")
-    # visualize_animation_plotly(
-    #     kp_positions_3d=positions_3d,
-    #     kp_colors_rgb=colors_rgb,
-    #     pc_positions=pc_positions,
-    #     pc_colors=pc_colors,
-    #     output_html=args.output_html,
-    # )
+    
+    if len(rigid_transforms) > 0:
+         R_final, t_final = rigid_transforms[-1]
+         
+         # Construct final point cloud positions for visualization
+         # Background (P \ Y)
+         mask_Y = np.zeros(point_cloud.shape[0], dtype=bool)
+         mask_Y[Y_indices] = True
+         points_bg = point_cloud[~mask_Y]
+         if points_bg.shape[1] > 3: 
+             points_bg = points_bg[:, :3]
+         
+         # Moved Object (Y transformed)
+         # Y points at t=0
+         points_Y = point_cloud[Y_indices]
+         if points_Y.shape[1] > 3:
+             points_Y = points_Y[:, :3]
+         points_Y_final = points_Y @ R_final.T + t_final
+         
+         points_final = np.vstack([points_bg, points_Y_final])
+         
+         print("[MAIN] Visualizing updated canonical grid (Latent PCA)...")
+         visualize_pca_open3d(
+            points_3d=points_final,
+            grid=grid,
+            decoder=decoder,
+            device=device,
+            camera_extrinsic=camera_extrinsic_vis,
+         )
 
-    # ==========================================================================================
-    #  Dynamic PCA visualization every 20 steps
-    # ==========================================================================================
-    if Y_indices.size > 0:
-        # NEW: Create ObjectGrid holding ONLY object voxels
-        print("[MAIN] Creating ObjectGrid with only object voxels...")
-        
-        points_Y = point_cloud[Y_indices]
-        if points_Y.shape[1] > 3: 
-            points_Y = points_Y[:, :3]
-            
-        points_Y_tensor = torch.from_numpy(points_Y).float() # .to(device) done inside init
-        
-        object_grid = ObjectGrid(grid, points_Y_tensor, device)
-
-        # visualize_dynamic_pca_open3d(
-        #     points_all=point_cloud,
-        #     grid=grid,
-        #     object_grid=object_grid,
-        #     decoder=decoder,
-        #     device=device,
-        #     Y_indices=Y_indices,
-        #     transforms=transforms,
-        #     step_interval=args.dynamic_pca_interval,
-        #     max_points=2000000,
-        #     batch_size=100000,
-        #     camera_extrinsic=camera_extrinsic_dynamic_pca,
-        #     output_video_path=args.output_video_path,
-        #     fps=10,
-        # )
-        
-        # ==========================================================================================
-        #  Distill moved features back to canonical grid & Visualize
-        # ==========================================================================================
-        if len(transforms) > 0:
-             R_final, t_final = transforms[-1]
+         # 2. Visualize SDF Mesh PCA (if sdf_decoder available)
+         if sdf_decoder is not None:
+             print("[MAIN] Generating SDF Mesh PCA...")
+             output_dir_path = Path(args.run_dir)
+             env_name_vis = "final_vis_online"
              
-             # Distill
-             distill_object_features(
+             save_sdf_mesh_pca(
                  grid=grid,
-                 object_grid=object_grid,
                  decoder=decoder,
-                 points_Y_local=points_Y,
-                 R_final=R_final,
-                 t_final=t_final,
+                 sdf_decoder=sdf_decoder,
+                 env_name=env_name_vis,
+                 epoch_label="final",
                  device=device,
+                 config=config,
+                 output_dir=output_dir_path
              )
              
-             # Final Visualization with updated grid
-             print("[MAIN] Visualizing updated canonical grid with moved particles...")
-             
-             # Construct final point cloud positions
-             # Background (P \ Y)
-             mask_Y = np.zeros(point_cloud.shape[0], dtype=bool)
-             mask_Y[Y_indices] = True
-             points_bg = point_cloud[~mask_Y]
-             if points_bg.shape[1] > 3: 
-                 points_bg = points_bg[:, :3]
-             
-             # Moved Object (Y transformed)
-             points_Y_final = points_Y @ R_final.T + t_final
-             
-             points_final = np.vstack([points_bg, points_Y_final])
-             
-             visualize_pca_open3d(
-                points_3d=points_final,
-                grid=grid,
-                decoder=decoder,
-                device=device,
-                camera_extrinsic=camera_extrinsic_dynamic_pca,
-             )
-
-             # 2. Visualize SDF Mesh PCA (if sdf_decoder available)
-             if sdf_decoder is not None:
-                 print("[MAIN] Generating SDF Mesh PCA...")
-                 output_dir_path = Path(args.run_dir)
-                 env_name_vis = "final_vis"
+             # Try to load and visualize the saved mesh
+             mesh_path = output_dir_path / env_name_vis / "sdf_mesh_pca.ply"
+             if mesh_path.exists():
+                 print(f"[MAIN] Loading generated mesh from {mesh_path} for visualization...")
+                 mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+                 mesh.compute_vertex_normals()
                  
-                 save_sdf_mesh_pca(
-                     grid=grid,
-                     decoder=decoder,
-                     sdf_decoder=sdf_decoder,
-                     env_name=env_name_vis,
-                     epoch_label="final",
-                     device=device,
-                     config=config,
-                     output_dir=output_dir_path
+                 draw_geometries_with_key_callbacks(
+                    [mesh],
+                    window_name="SDF Mesh PCA - Final",
+                    camera_extrinsic=camera_extrinsic_vis,
                  )
-                 
-                 # Try to load and visualize the saved mesh
-                 mesh_path = output_dir_path / env_name_vis / "sdf_mesh_pca.ply"
-                 if mesh_path.exists():
-                     print(f"[MAIN] Loading generated mesh from {mesh_path} for visualization...")
-                     mesh = o3d.io.read_triangle_mesh(str(mesh_path))
-                     mesh.compute_vertex_normals()
-                     
-                     draw_geometries_with_key_callbacks(
-                        [mesh],
-                        window_name="SDF Mesh PCA - Final",
-                        camera_extrinsic=camera_extrinsic_dynamic_pca,
-                     )
-             
-    else:
-        print("[MAIN] Skipping dynamic PCA because Y is empty.")
-
 
 if __name__ == "__main__":
     main()
